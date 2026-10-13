@@ -683,6 +683,9 @@ dependencies = [
 mlx = [
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
 ]
+vision = [
+    { name = "pillow" },
+]
 serve = [
     { name = "fastapi" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -707,6 +710,7 @@ requires-dist = [
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'serve'", specifier = ">=0.31.3,<0.32" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "peft", specifier = ">=0.21" },
+    { name = "pillow", marker = "extra == 'vision'", specifier = ">=10" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
     { name = "torch", specifier = ">=2.6,<2.9" },
@@ -714,7 +718,7 @@ requires-dist = [
     { name = "typesafe-sdk", marker = "extra == 'serve'", specifier = ">=0.6.0" },
     { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.30" },
 ]
-provides-extras = ["serve", "mlx"]
+provides-extras = ["serve", "mlx", "vision"]
 
 [package.metadata.requires-dev]
 dev = [
