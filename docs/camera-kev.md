@@ -12,20 +12,20 @@ Use the existing [image decision format](vision-training.md#data). A mixed recor
 {"image":"images/001.jpg","state":"","questions":{"mode_夜景":{"type":"noul","instructions":"这张图是夜景吗？","label":true},"seka_色调":{"type":"choice","instructions":"这幅画面的色调是哪一项？","criteria":{"暖调":null,"冷调":null,"中性色调":null,"混合色调":null},"label":"冷调"}}}
 ```
 
-For a collection, set `TRAIN_META` and `VAL_META` to JSON files with CameraModel's `root`, `annotation`, and `repeat_time` fields. For single JSONL files, set `TRAIN_DATA` and `VAL_DATA`. Image paths in JSONL are relative to the JSONL directory; image paths in a collection are relative to its `root`. Validation collections must have `repeat_time=1`.
+For a collection, set `TRAIN_META` to a JSON file with CameraModel's `root`, `annotation`, and `repeat_time` fields. For a single JSONL file, set `TRAIN_DATA`. Set either `VAL_META` or `VAL_DATA` only if you have a separate image validation set; leave both empty to skip validation. Image paths in JSONL are relative to the JSONL directory; image paths in a collection are relative to its `root`. Validation collections must have `repeat_time=1`.
 
-The preflight checks every label and image path and rejects a train/validation image path overlap. Split by original image or scene before converting 39 questions into 24; the path check cannot detect duplicate image bytes under different filenames. Keep the validation images separate from training.
+The preflight checks every label and image path. When validation data is supplied, it also rejects a train/validation image path overlap. Split by original image or scene before converting 39 questions into 24; the path check cannot detect duplicate image bytes under different filenames. Kev's existing frozen training and validation suites contain text decisions, not image paths, so this command does not use them as an image validation set.
 
 ```bash
-python -m kev.camera.train --train-data /data/train.jsonl --val-data /data/val.jsonl --validate-data
+python -m kev.camera.train --train-data /data/train.jsonl --validate-data
 ```
 
 ## Train
 
-Run this on the machine with the checkpoint directory and its `modeling_camera_agent.py`, `configuration_camera_agent.py`, tokenizer files, and weights. The custom code and its dependencies must work in the selected CameraModel Python environment. `trust_remote_code=True` executes that checkpoint's Python code. The checkpoint supplied in the request is not mounted in this repository's environment, so its runtime API still needs a one-step check there.
+Run this on the machine with the checkpoint directory and its `modeling_camera_agent.py`, `configuration_camera_agent.py`, tokenizer files, and weights. Hugging Face's local `auto_map` loader reads those Python modules from the model directory. `CAMERA_CODE_DIR` is optional: set it only if those modules import other packages from a separate CameraModel source tree. Adding a directory to `PYTHONPATH` does not replace missing `modeling_camera_agent.py` or `configuration_camera_agent.py` in the checkpoint directory. The custom code and its dependencies must work in the selected Python environment. `trust_remote_code=True` executes that checkpoint's Python code. The checkpoint supplied in the request is not mounted in this repository's environment, so its runtime API still needs a one-step check there.
 
 ```bash
-TRAIN_DATA=/data/train.jsonl VAL_DATA=/data/val.jsonl \
+TRAIN_DATA=/data/train.jsonl \
   OUTPUT_DIR=/data/runs/camera-kev-04b \
   GPUS=8 bash shell/train_camera_kev.sh --max-steps 1
 
@@ -36,7 +36,7 @@ TRAIN_DATA=/data/train.jsonl VAL_DATA=/data/val.jsonl \
 
 The shell defaults to the supplied 0.4B checkpoint path, the CameraModel conda environment, eight GPUs, bf16 and FlashAttention 2. It uses AdamW with the source launcher's 0.9/0.95 betas, `1e-8` epsilon, `0.01` weight decay, 3% warmup, cosine decay, gradient checkpointing, and 2560-token rows. Backbone learning rate is `1e-5`; the newly initialized pointer head uses `1e-4`. `GRADIENT_ACC=8` means eight images per optimizer step per GPU. `QUESTIONS_PER_PASS=4` limits simultaneous question graphs. Set `GPUS=1` for a single GPU. `CAMERA_ENV_BIN`, `CAMERA_CODE_DIR`, `TORCHRUN`, `MODEL_NAME_OR_PATH`, `IMAGE_SIZE`, `MAX_LENGTH`, `SAVE_STEPS`, and learning rate variables can override the defaults. `--freeze-backbone`, `--freeze-llm`, and `--freeze-mlp` are available for ablations.
 
-This trainer uses PyTorch distributed data parallel instead of the source script's DeepSpeed ZeRO-2 and packed generative loss. It trains the dense model and pointer head on image-level decision loss. It saves `final/camera/`, `final/pointer.pt`, `final/camera_decision.json`, and per-epoch validation metrics. Intermediate checkpoints go under `checkpoint-<step>/` when `SAVE_STEPS` is reached. An existing output directory is refused.
+This trainer uses PyTorch distributed data parallel instead of the source script's DeepSpeed ZeRO-2 and packed generative loss. It loads the checkpoint's language model and its LM head, but does not run the LM head or generate text. The LM head is frozen. A new Kev pointer head starts from random weights, reads option-boundary hidden states, and is trained together with the selected CameraAgent weights. The save includes the unchanged LM head for CameraAgent checkpoint compatibility, plus `final/pointer.pt` for the trained decision head. It also writes `final/camera_decision.json` and per-epoch training metrics; validation metrics appear only when validation data was supplied. Intermediate checkpoints go under `checkpoint-<step>/` when `SAVE_STEPS` is reached. An existing output directory is refused.
 
 ## Predict
 

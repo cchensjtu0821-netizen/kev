@@ -12,11 +12,18 @@ TRAIN_DATA="${TRAIN_DATA:-}"
 VAL_DATA="${VAL_DATA:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/runs/camera-kev-04b}"
 CAMERA_ENV_BIN="${CAMERA_ENV_BIN:-/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/condaenv/MoE_CameraModel/bin}"
-CAMERA_CODE_DIR="${CAMERA_CODE_DIR:-/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/CameraBaseModel/vlm_hisi_nch_release_0309_memfix}"
+CAMERA_CODE_DIR="${CAMERA_CODE_DIR:-}"
 TORCHRUN="${TORCHRUN:-${CAMERA_ENV_BIN}/torchrun}"
 
 export PATH="${CAMERA_ENV_BIN}:${PATH}"
-export PYTHONPATH="${PROJECT_DIR}:${CAMERA_CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -n "${CAMERA_CODE_DIR}" ]]; then
+  if [[ ! -d "${CAMERA_CODE_DIR}" ]]; then
+    echo "CameraAgent source directory not found: ${CAMERA_CODE_DIR}" >&2
+    exit 2
+  fi
+  export PYTHONPATH="${CAMERA_CODE_DIR}:${PYTHONPATH}"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
@@ -45,12 +52,14 @@ else
   echo "Set exactly one of TRAIN_META or TRAIN_DATA" >&2
   exit 2
 fi
-if [[ -n "${VAL_META}" && -z "${VAL_DATA}" ]]; then
+if [[ -z "${VAL_META}" && -z "${VAL_DATA}" ]]; then
+  val_args=()
+elif [[ -n "${VAL_META}" && -z "${VAL_DATA}" ]]; then
   val_args=(--val-meta "${VAL_META}")
 elif [[ -n "${VAL_DATA}" && -z "${VAL_META}" ]]; then
   val_args=(--val-data "${VAL_DATA}")
 else
-  echo "Set exactly one of VAL_META or VAL_DATA" >&2
+  echo "Set at most one of VAL_META or VAL_DATA" >&2
   exit 2
 fi
 
