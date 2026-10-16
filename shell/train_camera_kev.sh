@@ -31,16 +31,35 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 GPUS="${GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-32006}"
 EPOCHS="${EPOCHS:-3}"
-GRADIENT_ACC="${GRADIENT_ACC:-8}"
-QUESTIONS_PER_PASS="${QUESTIONS_PER_PASS:-4}"
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-8}"
+GRADIENT_ACC="${GRADIENT_ACC:-2}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 MAX_LENGTH="${MAX_LENGTH:-2560}"
 IMAGE_SIZE="${IMAGE_SIZE:-384}"
+HEAD_DIM="${HEAD_DIM:-256}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 HEAD_LR="${HEAD_LR:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 SAVE_STEPS="${SAVE_STEPS:-2500}"
+MAX_STEPS="${MAX_STEPS:-0}"
+SEED="${SEED:-17}"
+FREEZE_BACKBONE="${FREEZE_BACKBONE:-false}"
+FREEZE_LLM="${FREEZE_LLM:-false}"
+FREEZE_MLP="${FREEZE_MLP:-false}"
+
+freeze_args=()
+add_freeze_flag() {
+  local name="$1" value="${!1}" flag="$2"
+  case "${value,,}" in
+    1|true) freeze_args+=("${flag}") ;;
+    0|false) ;;
+    *) echo "${name} must be true/false or 1/0, got: ${value}" >&2; exit 2 ;;
+  esac
+}
+add_freeze_flag FREEZE_BACKBONE --freeze-backbone
+add_freeze_flag FREEZE_LLM --freeze-llm
+add_freeze_flag FREEZE_MLP --freeze-mlp
 
 train_args=()
 val_args=()
@@ -72,10 +91,10 @@ fi
   --nproc-per-node="${GPUS}" --master-port="${MASTER_PORT}" -m kev.camera.train \
   "${train_args[@]}" "${val_args[@]}" \
   --model "${MODEL_NAME_OR_PATH}" --out "${OUTPUT_DIR}" \
-  --epochs "${EPOCHS}" --accum "${GRADIENT_ACC}" \
-  --questions-per-pass "${QUESTIONS_PER_PASS}" \
+  --epochs "${EPOCHS}" --batch "${PER_DEVICE_BATCH_SIZE}" --accum "${GRADIENT_ACC}" \
   --num-workers "${DATALOADER_NUM_WORKERS}" \
-  --max-length "${MAX_LENGTH}" --image-size "${IMAGE_SIZE}" \
+  --max-length "${MAX_LENGTH}" --image-size "${IMAGE_SIZE}" --head-dim "${HEAD_DIM}" \
   --lr "${LEARNING_RATE}" --head-lr "${HEAD_LR}" \
   --weight-decay "${WEIGHT_DECAY}" --warmup-ratio "${WARMUP_RATIO}" \
-  --save-every-steps "${SAVE_STEPS}" "$@"
+  --save-every-steps "${SAVE_STEPS}" --max-steps "${MAX_STEPS}" --seed "${SEED}" \
+  "${freeze_args[@]}" "$@"

@@ -1,17 +1,19 @@
 """CameraAgent adapter contracts without private model weights."""
 
+import copy
 import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 
 from kev.camera.data import CameraImageDataset
-from kev.camera.model import CameraDecisionModel, encode_record
-from kev.camera.train import datasets, first_item, parse_args
+from kev.camera.model import CameraDecisionModel, encode_record, pack_record
+from kev.camera.train import datasets, evaluate, first_item, parse_args, train_batch
 
 
 class TinyTokenizer:
@@ -27,8 +29,20 @@ class TinyTokenizer:
 
 
 class TinyBackbone(nn.Module):
-    def forward(self, *, inputs_embeds, attention_mask, use_cache, return_dict):
-        return SimpleNamespace(last_hidden_state=inputs_embeds.cumsum(dim=1))
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.last_shape = None
+
+    def forward(self, *, inputs_embeds, attention_mask, use_cache, return_dict, position_ids=None):
+        self.calls += 1
+        self.last_shape = inputs_embeds.shape
+        if attention_mask.ndim == 4:
+            allowed = (attention_mask[:, 0] == 0).to(inputs_embeds.dtype)
+            hidden = allowed @ inputs_embeds
+        else:
+            hidden = inputs_embeds.cumsum(dim=1)
+        return SimpleNamespace(last_hidden_state=hidden)
 
 
 class TinyLanguage(nn.Module):
@@ -49,7 +63,7 @@ class TinyCamera(nn.Module):
         self.config = SimpleNamespace(llm_config=SimpleNamespace(hidden_size=4))
 
     def extract_feature(self, pixels):
-        return self.projector(pixels.reshape(1, 1, 1)).expand(1, 3, 4)
+        return self.projector(pixels.reshape(-1, 1, 1)).expand(-1, 3, 4)
 
 
 def record():
@@ -73,6 +87,70 @@ def test_camera_pointer_keeps_questions_isolated_and_trains_visual_path():
     first[0].sum().backward()
     assert model.camera.projector.weight.grad.abs().sum() > 0
     assert model.head.q.weight.grad.abs().sum() > 0
+
+
+def test_train_batch_averages_images_with_unequal_question_counts_and_partial_group():
+    torch.manual_seed(4)
+    model = CameraDecisionModel(TinyCamera(), TinyTokenizer(), head_dim=3, max_length=500)
+    reference = copy.deepcopy(model)
+    records = [record(), {"state": "second", "questions": record()["questions"][:1]}, record()]
+    items = [{"record": row, "pixels": torch.tensor([float(i + 1)])}
+             for i, row in enumerate(records)]
+    first_loss = train_batch(model, items[:2], device=torch.device("cpu"),
+                             group_images=3, sync_at_end=False)
+    last_loss = train_batch(model, items[2:], device=torch.device("cpu"),
+                            group_images=3, sync_at_end=True)
+    expected = []
+    for item in items:
+        logits = reference(item["record"], item["pixels"])
+        losses = [F.cross_entropy(z.unsqueeze(0), torch.tensor([q["label"]]))
+                  for z, q in zip(logits, item["record"]["questions"])]
+        expected.append(torch.stack(losses).mean())
+    torch.stack(expected).mean().backward()
+    assert first_loss + last_loss == pytest.approx(sum(float(loss.detach()) for loss in expected), abs=1e-6)
+    for trained, direct in zip(model.parameters(), reference.parameters()):
+        assert torch.allclose(trained.grad, direct.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_batched_camera_forward_matches_individual_rows():
+    torch.manual_seed(5)
+    model = CameraDecisionModel(TinyCamera(), TinyTokenizer(), head_dim=3, max_length=500)
+    records = [record(), {"state": "a longer state", "questions": record()["questions"][:1]}]
+    pixels = torch.tensor([1.0, 2.0])
+    batched = model(records, pixels, question_start=0, question_end=2)
+    assert [len(group) for group in batched] == [2, 1]
+    for index, row in enumerate(records):
+        direct = model(row, pixels[index:index + 1])
+        for actual, expected in zip(batched[index], direct):
+            assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    changed = copy.deepcopy(records)
+    changed[0]["questions"][1]["instr"] = "Different second task"
+    assert torch.allclose(model(changed, pixels)[0][0], batched[0][0], atol=1e-6, rtol=1e-6)
+    encoded = encode_record(model.tokenizer, records[0], image_tokens=3, max_length=500)
+    packed = pack_record(encoded)
+    prefix = encoded[0]["prefix_length"]
+    assert len(packed["ids"]) == sum(len(row["ids"]) for row in encoded) - prefix
+    assert packed["segments"].count(0) == prefix
+    assert packed["positions"][prefix] == packed["positions"][packed["segments"].index(2)]
+
+
+def test_identical_question_templates_need_no_batch_padding():
+    model = CameraDecisionModel(TinyCamera(), TinyTokenizer(), head_dim=3, max_length=500)
+    rows = [record(), record()]
+    encoded = encode_record(model.tokenizer, rows[0], image_tokens=3, max_length=500)
+    expected_length = len(pack_record(encoded)["ids"])
+    assert len(model(rows, torch.tensor([1.0, 2.0]))) == 2
+    assert model.camera.language_model.model.last_shape == (2, expected_length, 4)
+
+
+def test_validation_and_prediction_run_all_questions_in_one_packed_forward():
+    model = CameraDecisionModel(TinyCamera(), TinyTokenizer(), head_dim=3, max_length=500)
+    item = {"record": record(), "pixels": torch.tensor([1.0])}
+    result = evaluate(model, [item], device=torch.device("cpu"))
+    assert result["questions"] == 2
+    assert model.camera.language_model.model.calls == 1
+    assert len(model.probabilities(item["record"], item["pixels"])) == 2
+    assert model.camera.language_model.model.calls == 2
 
 
 def test_encoding_counts_actual_visual_tokens_and_rejects_overflow():
@@ -99,6 +177,7 @@ def test_dataset_preflight_accepts_noul_and_choice_and_catches_image_overlap(tmp
     training.write_text(json.dumps(row) + "\n", encoding="utf-8")
     validation.write_text(json.dumps({**row, "image": "val.jpg"}) + "\n", encoding="utf-8")
     args = parse_args(["--train-data", str(training), "--val-data", str(validation), "--validate-data"])
+    assert (args.batch, args.accum) == (8, 2)
     train, val = datasets(args)
     assert [q["label"] for q in train[0]["record"]["questions"]] == [0, 0]
     assert len(val) == 1

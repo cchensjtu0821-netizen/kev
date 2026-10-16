@@ -42,24 +42,22 @@ def first_item(items):
     return items[0]
 
 
-def evaluate(model, loader, *, device, questions_per_pass):
+def evaluate(model, loader, *, device):
     model.eval()
     correct = count = 0
     brier = 0.0
     with torch.inference_mode():
         for item in loader:
-            pixels = item["pixels"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
-            questions = item["record"]["questions"]
-            for start in range(0, len(questions), questions_per_pass):
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = model(item["record"], pixels, question_start=start,
-                                   question_end=start + questions_per_pass)
-                for question, z in zip(questions[start:], logits):
-                    p = z.float().softmax(-1)
-                    label = question["label"]
-                    correct += int(p.argmax().item() == label)
-                    brier += float(((p - F.one_hot(torch.tensor(label, device=device), p.numel())) ** 2).sum())
-                    count += 1
+            pixels = item["pixels"].to(device=device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+                                       non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                logits = model([item["record"]], pixels)[0]
+            for question, z in zip(item["record"]["questions"], logits):
+                p = z.float().softmax(-1)
+                label = question["label"]
+                correct += int(p.argmax().item() == label)
+                brier += float(((p - F.one_hot(torch.tensor(label, device=device), p.numel())) ** 2).sum())
+                count += 1
     return {"questions": count, "accuracy": correct / count, "brier": brier / count}
 
 
@@ -75,8 +73,8 @@ def parse_args(argv=None):
     parser.add_argument("--model", help="local CameraAgent checkpoint directory")
     parser.add_argument("--out")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--accum", type=int, default=8, help="images per optimizer step per GPU")
-    parser.add_argument("--questions-per-pass", type=int, default=4)
+    parser.add_argument("--batch", type=int, default=8, help="images per DataLoader batch per GPU")
+    parser.add_argument("--accum", type=int, default=2, help="DataLoader batches per optimizer step")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--head-lr", type=float, default=1e-4)
@@ -92,13 +90,34 @@ def parse_args(argv=None):
     parser.add_argument("--freeze-mlp", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
     args = parser.parse_args(argv)
-    if min(args.epochs, args.accum, args.questions_per_pass, args.max_length, args.image_size, args.head_dim) < 1:
-        parser.error("epochs, accum, questions-per-pass, max-length, image-size and head-dim must be positive")
+    if min(args.epochs, args.batch, args.accum, args.max_length, args.image_size, args.head_dim) < 1:
+        parser.error("epochs, batch, accum, max-length, image-size and head-dim must be positive")
     if args.lr <= 0 or args.head_lr <= 0 or args.weight_decay < 0 or not 0 <= args.warmup_ratio < 1:
         parser.error("invalid optimizer settings")
     if args.max_steps < 0 or args.save_every_steps < 0 or args.num_workers < 0:
         parser.error("max-steps, save-every-steps and num-workers must be nonnegative")
     return args
+
+
+def train_batch(wrapped, items, *, device, group_images, sync_at_end):
+    """Forward the image batch together and average each image's questions."""
+    pixels = torch.cat([item["pixels"] for item in items]).to(
+        device=device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+        non_blocking=True)
+    records = [item["record"] for item in items]
+    context = nullcontext() if sync_at_end or not isinstance(wrapped, DistributedDataParallel) else wrapped.no_sync()
+    with context, torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                 enabled=device.type == "cuda"):
+        logits = wrapped(records, pixels)
+        losses = []
+        for record, image_logits in zip(records, logits):
+            question_losses = [F.cross_entropy(z.float().unsqueeze(0),
+                                               torch.tensor([question["label"]], device=device))
+                               for question, z in zip(record["questions"], image_logits)]
+            losses.append(torch.stack(question_losses).mean())
+        loss = torch.stack(losses).sum() / group_images
+    loss.backward()
+    return float(loss.detach()) * group_images
 
 
 def main(argv=None):
@@ -160,8 +179,8 @@ def main(argv=None):
     train_images = CameraImageDataset(train, args.image_size)
     sampler = DistributedSampler(train_images, num_replicas=world, rank=local_rank, shuffle=True,
                                  seed=args.seed) if world > 1 else None
-    loader = DataLoader(train_images, batch_size=1, shuffle=sampler is None, sampler=sampler,
-                        collate_fn=first_item, num_workers=args.num_workers,
+    loader = DataLoader(train_images, batch_size=args.batch, shuffle=sampler is None, sampler=sampler,
+                        collate_fn=list, num_workers=args.num_workers,
                         pin_memory=True, persistent_workers=args.num_workers > 0)
     valid_loader = None
     if valid is not None and local_rank == 0:
@@ -184,24 +203,14 @@ def main(argv=None):
         model.train()
         train_loss = 0.0
         seen = 0
-        for index, item in enumerate(loader):
-            pixels = item["pixels"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
-            questions = item["record"]["questions"]
-            group_size = min(args.accum, len(loader) - (index // args.accum) * args.accum)
-            for start in range(0, len(questions), args.questions_per_pass):
-                last_chunk = start + args.questions_per_pass >= len(questions)
-                sync = last_chunk and ((index + 1) % args.accum == 0 or index + 1 == len(loader))
-                context = nullcontext() if sync or world == 1 else wrapped.no_sync()
-                with context, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = wrapped(item["record"], pixels, question_start=start,
-                                     question_end=start + args.questions_per_pass)
-                    losses = [F.cross_entropy(z.float().unsqueeze(0),
-                                              torch.tensor([q["label"]], device=device))
-                              for z, q in zip(logits, questions[start:])]
-                    loss = torch.stack(losses).sum() / (len(questions) * group_size)
-                loss.backward()
-                train_loss += float(loss.detach()) * group_size
-            seen += 1
+        epoch_images = len(sampler) if sampler is not None else len(train_images)
+        for index, items in enumerate(loader):
+            group_images = min(args.batch * args.accum,
+                               epoch_images - (index // args.accum) * args.batch * args.accum)
+            sync = (index + 1) % args.accum == 0 or index + 1 == len(loader)
+            train_loss += train_batch(wrapped, items, device=device,
+                                      group_images=group_images, sync_at_end=sync)
+            seen += len(items)
             if sync:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -226,8 +235,7 @@ def main(argv=None):
         if local_rank == 0:
             result = {"epoch": epoch + 1, "step": step, "train_loss": train_loss / seen}
             if valid is not None:
-                result["validation"] = evaluate(model, valid_loader, device=device,
-                                                questions_per_pass=args.questions_per_pass)
+                result["validation"] = evaluate(model, valid_loader, device=device)
             print(json.dumps(result), flush=True)
             out = Path(args.out)
             out.mkdir(parents=True, exist_ok=True)

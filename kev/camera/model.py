@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kev.model import PointerHead, user_tokens
+from kev.model import PointerHead, branch_mask_batch, user_tokens
 
 
 IMAGE_MEAN = (0.485, 0.456, 0.406)
@@ -56,9 +56,29 @@ def encode_record(tok, record, image_tokens, max_length):
         if len(prefix) + len(branch) > max_length:
             raise ValueError(f"image question has {len(prefix) + len(branch)} tokens, over max_length={max_length}")
         rows.append({"ids": prefix + branch, "image_start": image_start,
+                     "prefix_length": len(prefix),
                      "option_indices": [len(prefix) + end for end in ends],
                      "decide_index": len(prefix) + len(branch) - 1})
     return rows
+
+
+def pack_record(rows, question_start=0, question_end=None):
+    """Place the shared image prefix once and keep every question in its own causal branch."""
+    prefix_length = rows[0]["prefix_length"]
+    ids = rows[0]["ids"][:prefix_length]
+    segments = [0] * prefix_length
+    positions = list(range(prefix_length))
+    readouts = []
+    for question_index, row in enumerate(rows[question_start:question_end], start=1):
+        branch = row["ids"][prefix_length:]
+        base = len(ids) - prefix_length
+        ids.extend(branch)
+        segments.extend([question_index] * len(branch))
+        positions.extend(range(prefix_length, prefix_length + len(branch)))
+        readouts.append((base + row["decide_index"],
+                         [base + index for index in row["option_indices"]]))
+    return {"ids": ids, "segments": segments, "positions": positions,
+            "image_start": rows[0]["image_start"], "readouts": readouts}
 
 
 class CameraDecisionModel(nn.Module):
@@ -86,6 +106,9 @@ class CameraDecisionModel(nn.Module):
         return visual
 
     def forward(self, record, pixels, *, question_start=0, question_end=None):
+        if isinstance(record, list):
+            return self.forward_batch(record, pixels, question_start=question_start,
+                                      question_end=question_end)
         visual = self._features(pixels)
         rows = encode_record(self.tokenizer, record, visual.shape[1], self.max_length)
         embedding = self.camera.language_model.get_input_embeddings()
@@ -104,10 +127,48 @@ class CameraDecisionModel(nn.Module):
             outputs.append(self.head(hidden[row["decide_index"]], hidden[opts]))
         return outputs
 
+    def forward_batch(self, records, pixels, *, question_start=0, question_end=None):
+        visual = self.camera.extract_feature(pixels)
+        if isinstance(visual, (tuple, list)):
+            visual = visual[0]
+        if visual.ndim != 3 or visual.shape[0] != len(records) or visual.shape[2] != self.head.q.in_features:
+            raise ValueError(f"expected {len(records)} images with projected hidden size "
+                             f"{self.head.q.in_features}, got {tuple(visual.shape)}")
+        packed = [pack_record(encode_record(self.tokenizer, record, visual.shape[1], self.max_length),
+                              question_start, question_end) for record in records]
+        if not any(item["readouts"] for item in packed):
+            return [[] for _ in records]
+        embedding = self.camera.language_model.get_input_embeddings()
+        max_length = max(len(item["ids"]) for item in packed)
+        same_length = all(len(item["ids"]) == max_length for item in packed)
+        padded = []
+        positions = torch.zeros((len(packed), max_length), device=pixels.device, dtype=torch.long)
+        for index, item in enumerate(packed):
+            ids = torch.tensor(item["ids"], device=pixels.device)
+            embedded = embedding(ids)
+            start = item["image_start"]
+            value = torch.cat((embedded[:start], visual[index].to(embedded.dtype),
+                               embedded[start + visual.shape[1]:]), dim=0)
+            padded.append(value if same_length else F.pad(value, (0, 0, 0, max_length - len(value))))
+            positions[index, :len(ids)] = torch.tensor(item["positions"], device=pixels.device)
+        inputs = torch.stack(padded)
+        same_segments = all(item["segments"] == packed[0]["segments"] for item in packed)
+        mask = branch_mask_batch([packed[0]["segments"]] if same_segments else
+                                 [item["segments"] for item in packed], pixels.device,
+                                 dtype=inputs.dtype, length=max_length)
+        if same_segments:
+            mask = mask.expand(len(packed), -1, -1, -1)
+        hidden = self.camera.language_model.model(
+            inputs_embeds=inputs, position_ids=positions, attention_mask=mask,
+            use_cache=False, return_dict=True,
+        ).last_hidden_state.float()
+        return [[self.head(hidden[index, decide], hidden[index, torch.tensor(options, device=pixels.device)])
+                 for decide, options in item["readouts"]] for index, item in enumerate(packed)]
+
     @torch.no_grad()
     def probabilities(self, record, pixels):
         self.eval()
-        return [F.softmax(logits, dim=-1).cpu() for logits in self(record, pixels)]
+        return [F.softmax(logits, dim=-1).cpu() for logits in self([record], pixels)[0]]
 
     def save(self, path, *, source, image_size):
         path = Path(path)
