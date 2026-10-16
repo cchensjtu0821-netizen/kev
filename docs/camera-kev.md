@@ -45,6 +45,8 @@ Rank 0 prints a JSON start record and one progress record after every optimizer 
 
 Both training and prediction configure the nested `llm_config` for eager attention and pass `use_flash_attn=False` to the CameraAgent constructor. Setting only the outer model's `attn_implementation` can leave Qwen3 on FlashAttention, whose padding-mask handling cannot consume the four-dimensional branch mask. The adapter checks the language model and each attention layer before the first forward pass; `train_start` reports the effective `attention_backend`.
 
+Training and prediction share an image reader that sets `PIL.Image.MAX_IMAGE_PIXELS = None` before opening an image, matching CameraModel's policy for local datasets. The setting runs inside each DataLoader worker as well, so high-resolution source images can be decoded and resized to the configured training size.
+
 This trainer uses PyTorch distributed data parallel instead of the source script's DeepSpeed ZeRO-2 and packed generative loss. It loads the checkpoint's language model and its LM head, but does not run the LM head or generate text. The LM head is frozen. A new Kev pointer head starts from random weights, reads option-boundary hidden states, and is trained together with the selected CameraAgent weights. The save includes the unchanged LM head for CameraAgent checkpoint compatibility, plus `final/pointer.pt` for the trained decision head. It also writes `final/camera_decision.json` and per-epoch training metrics; validation metrics appear only when validation data was supplied. Intermediate checkpoints go under `checkpoint-<step>/` when `SAVE_STEPS` is reached. An existing output directory is refused.
 
 ## Predict

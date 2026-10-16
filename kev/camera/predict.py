@@ -5,11 +5,11 @@ import json
 from pathlib import Path
 
 import torch
-from PIL import Image
 
 from kev.api import SystemOneRequest, to_record
 
-from .model import image_tensor, load
+from .data import load_image_tensor
+from .model import load
 
 
 def main(argv=None):
@@ -24,8 +24,7 @@ def main(argv=None):
         image_path = request_path.resolve().parent / image_path
     record, metadata = to_record(SystemOneRequest.model_validate(request))
     model, config = load(args.checkpoint)
-    with Image.open(image_path) as image:
-        pixels = image_tensor(image, config["image_size"]).to(device="cuda", dtype=torch.bfloat16)
+    pixels = load_image_tensor(image_path, config["image_size"]).to(device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         probs = [p.tolist() for p in model.probabilities(record, pixels)]
     result = {item["id"]: dict(zip(item["keys"], p)) for item, p in zip(metadata, probs)}
