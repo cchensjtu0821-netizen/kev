@@ -6,9 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from PIL import Image
+from torch.utils.data import DataLoader
 
+from kev.camera.data import CameraImageDataset
 from kev.camera.model import CameraDecisionModel, encode_record
-from kev.camera.train import datasets, parse_args
+from kev.camera.train import datasets, first_item, parse_args
 
 
 class TinyTokenizer:
@@ -119,3 +122,19 @@ def test_dataset_preflight_allows_no_validation(tmp_path):
         encoding="utf-8")
     with pytest.raises(FileNotFoundError, match="missing.jpg"):
         datasets(args)
+
+
+def test_image_decode_runs_through_dataloader_workers(tmp_path):
+    Image.new("RGB", (12, 18), (255, 0, 0)).save(tmp_path / "train.png")
+    training = tmp_path / "train.jsonl"
+    training.write_text(json.dumps({"image": "train.png", "state": "", "questions": {
+        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}) + "\n",
+        encoding="utf-8")
+    args = parse_args(["--train-data", str(training), "--validate-data"])
+    records, _ = datasets(args)
+    loader = DataLoader(CameraImageDataset(records, 32), batch_size=1, num_workers=2,
+                        collate_fn=first_item)
+    item = next(iter(loader))
+    assert item["pixels"].shape == (1, 3, 32, 32)
+    assert item["pixels"][0, 0, 0, 0].item() == pytest.approx((1 - 0.485) / 0.229)
+    assert item["record"]["questions"][0]["label"] == 0

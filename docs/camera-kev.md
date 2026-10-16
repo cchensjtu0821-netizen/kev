@@ -16,6 +16,8 @@ For a collection, set `TRAIN_META` to a JSON file with CameraModel's `root`, `an
 
 The preflight checks every label and image path. When validation data is supplied, it also rejects a train/validation image path overlap. Split by original image or scene before converting 39 questions into 24; the path check cannot detect duplicate image bytes under different filenames. Kev's existing frozen training and validation suites contain text decisions, not image paths, so this command does not use them as an image validation set.
 
+The dataset keeps JSONL byte offsets and image paths in memory, not decoded images. Startup scans the annotations once to check labels and paths. During training, PyTorch DataLoader workers read individual JSONL rows and open, resize, and normalize their images as needed; `DATALOADER_NUM_WORKERS` defaults to 4 per GPU process. The workers prefetch a small queue of samples. The same worker path handles validation images when a validation set is provided.
+
 ```bash
 python -m kev.camera.train --train-data /data/train.jsonl --validate-data
 ```

@@ -7,7 +7,7 @@ from .data import materialize
 
 
 class ImageDecisionDataset:
-    """Index JSONL byte offsets, then read and decode one example at a time.
+    """Index JSONL byte offsets, then read and materialize one record at a time.
 
     A collection uses CameraModel's ``root``, ``annotation`` and ``repeat_time``
     fields. Its rows need Kev's labelled ``questions``; a free-form caption is
