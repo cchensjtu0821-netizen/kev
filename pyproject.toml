@@ -59,4 +59,4 @@ testpaths = ["tests"]
 markers = ["server: needs a running kev.serve instance (KEV_BASE_URL)"]
 
 [tool.setuptools]
-packages = ["kev"]
+packages = ["kev", "kev.camera"]
