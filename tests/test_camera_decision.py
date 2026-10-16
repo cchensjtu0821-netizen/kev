@@ -102,3 +102,20 @@ def test_dataset_preflight_accepts_noul_and_choice_and_catches_image_overlap(tmp
     validation.write_text(json.dumps(row) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="share 1 image paths"):
         datasets(args)
+
+
+def test_dataset_preflight_allows_no_validation(tmp_path):
+    (tmp_path / "train.jpg").write_bytes(b"image")
+    training = tmp_path / "train.jsonl"
+    training.write_text(json.dumps({"image": "train.jpg", "state": "", "questions": {
+        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}) + "\n",
+        encoding="utf-8")
+    args = parse_args(["--train-data", str(training), "--validate-data"])
+    train, valid = datasets(args)
+    assert len(train) == 1
+    assert valid is None
+    training.write_text(json.dumps({"image": "missing.jpg", "state": "", "questions": {
+        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}) + "\n",
+        encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="missing.jpg"):
+        datasets(args)

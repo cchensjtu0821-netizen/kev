@@ -21,6 +21,9 @@ from .model import CameraDecisionModel, image_tensor
 
 def datasets(args):
     train = ImageDecisionDataset(data=args.train_data, meta=args.train_meta)
+    train_images = {train[i]["image"] for i in range(len(train))}
+    if not (args.val_data or args.val_meta):
+        return train, None
     valid = ImageDecisionDataset(data=args.val_data, meta=args.val_meta)
     train_files = {source[1].resolve() for source, _, _ in train.sources}
     valid_files = {source[1].resolve() for source, _, _ in valid.sources}
@@ -28,7 +31,6 @@ def datasets(args):
         raise ValueError("train and validation share an annotation file")
     if any(count != len(offsets) for _, offsets, count in valid.sources):
         raise ValueError("validation repeat_time must be 1")
-    train_images = {train[i]["image"] for i in range(len(train))}
     valid_images = {valid[i]["image"] for i in range(len(valid))}
     overlap = train_images & valid_images
     if overlap:
@@ -67,7 +69,7 @@ def parse_args(argv=None):
     train = parser.add_mutually_exclusive_group(required=True)
     train.add_argument("--train-data")
     train.add_argument("--train-meta")
-    valid = parser.add_mutually_exclusive_group(required=True)
+    valid = parser.add_mutually_exclusive_group()
     valid.add_argument("--val-data")
     valid.add_argument("--val-meta")
     parser.add_argument("--validate-data", action="store_true")
@@ -104,7 +106,7 @@ def main(argv=None):
     args = parse_args(argv)
     train, valid = datasets(args)
     if args.validate_data:
-        print(json.dumps({"train_images": len(train), "validation_images": len(valid)}))
+        print(json.dumps({"train_images": len(train), "validation_images": len(valid) if valid is not None else 0}))
         return
     if not args.model or not args.out:
         raise ValueError("training needs --model and --out")
@@ -218,10 +220,11 @@ def main(argv=None):
             train_loss, seen = stats.tolist()
             dist.barrier()
         if local_rank == 0:
-            result = {"epoch": epoch + 1, "step": step, "train_loss": train_loss / seen,
-                      "validation": evaluate(model, valid, device=device,
-                                             image_size=args.image_size,
-                                             questions_per_pass=args.questions_per_pass)}
+            result = {"epoch": epoch + 1, "step": step, "train_loss": train_loss / seen}
+            if valid is not None:
+                result["validation"] = evaluate(model, valid, device=device,
+                                                image_size=args.image_size,
+                                                questions_per_pass=args.questions_per_pass)
             print(json.dumps(result), flush=True)
             out = Path(args.out)
             out.mkdir(parents=True, exist_ok=True)
