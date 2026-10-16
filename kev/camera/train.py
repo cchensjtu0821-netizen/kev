@@ -10,13 +10,13 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from PIL import Image
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
 from kev.vision_data import ImageDecisionDataset
 
-from .model import CameraDecisionModel, image_tensor
+from .data import CameraImageDataset
+from .model import CameraDecisionModel
 
 
 def datasets(args):
@@ -42,14 +42,13 @@ def first_item(items):
     return items[0]
 
 
-def evaluate(model, dataset, *, device, image_size, questions_per_pass):
+def evaluate(model, loader, *, device, questions_per_pass):
     model.eval()
     correct = count = 0
     brier = 0.0
     with torch.inference_mode():
-        for item in dataset:
-            with Image.open(item["image"]) as image:
-                pixels = image_tensor(image, image_size).to(device=device, dtype=torch.bfloat16)
+        for item in loader:
+            pixels = item["pixels"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
             questions = item["record"]["questions"]
             for start in range(0, len(questions), questions_per_pass):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -158,11 +157,17 @@ def main(argv=None):
     optimizer = torch.optim.AdamW(({"params": backbone, "lr": args.lr},
                                    {"params": head, "lr": args.head_lr}),
                                   weight_decay=args.weight_decay, betas=(0.9, 0.95), eps=1e-8)
-    sampler = DistributedSampler(train, num_replicas=world, rank=local_rank, shuffle=True,
+    train_images = CameraImageDataset(train, args.image_size)
+    sampler = DistributedSampler(train_images, num_replicas=world, rank=local_rank, shuffle=True,
                                  seed=args.seed) if world > 1 else None
-    loader = DataLoader(train, batch_size=1, shuffle=sampler is None, sampler=sampler,
+    loader = DataLoader(train_images, batch_size=1, shuffle=sampler is None, sampler=sampler,
                         collate_fn=first_item, num_workers=args.num_workers,
                         pin_memory=True, persistent_workers=args.num_workers > 0)
+    valid_loader = None
+    if valid is not None and local_rank == 0:
+        valid_loader = DataLoader(CameraImageDataset(valid, args.image_size), batch_size=1,
+                                  collate_fn=first_item, num_workers=args.num_workers,
+                                  pin_memory=True, persistent_workers=args.num_workers > 0)
     total_steps = args.epochs * math.ceil(len(loader) / args.accum)
     if args.max_steps:
         total_steps = min(total_steps, args.max_steps)
@@ -180,8 +185,7 @@ def main(argv=None):
         train_loss = 0.0
         seen = 0
         for index, item in enumerate(loader):
-            with Image.open(item["image"]) as image:
-                pixels = image_tensor(image, args.image_size).to(device=device, dtype=torch.bfloat16)
+            pixels = item["pixels"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
             questions = item["record"]["questions"]
             group_size = min(args.accum, len(loader) - (index // args.accum) * args.accum)
             for start in range(0, len(questions), args.questions_per_pass):
@@ -222,8 +226,7 @@ def main(argv=None):
         if local_rank == 0:
             result = {"epoch": epoch + 1, "step": step, "train_loss": train_loss / seen}
             if valid is not None:
-                result["validation"] = evaluate(model, valid, device=device,
-                                                image_size=args.image_size,
+                result["validation"] = evaluate(model, valid_loader, device=device,
                                                 questions_per_pass=args.questions_per_pass)
             print(json.dumps(result), flush=True)
             out = Path(args.out)
