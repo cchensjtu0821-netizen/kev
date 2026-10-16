@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -196,6 +197,12 @@ def main(argv=None):
         0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup)))))
     wrapped = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True) if world > 1 else model
     step = 0
+    started = last_step = time.monotonic()
+    step_loss = step_images = 0
+    if local_rank == 0:
+        print(json.dumps({"event": "train_start", "images": len(train_images), "epochs": args.epochs,
+                          "total_steps": total_steps, "gpus": world, "batch_per_gpu": args.batch,
+                          "accum": args.accum}), flush=True)
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(args.epochs):
         if sampler is not None:
@@ -208,15 +215,36 @@ def main(argv=None):
             group_images = min(args.batch * args.accum,
                                epoch_images - (index // args.accum) * args.batch * args.accum)
             sync = (index + 1) % args.accum == 0 or index + 1 == len(loader)
-            train_loss += train_batch(wrapped, items, device=device,
-                                      group_images=group_images, sync_at_end=sync)
+            batch_loss = train_batch(wrapped, items, device=device,
+                                     group_images=group_images, sync_at_end=sync)
+            train_loss += batch_loss
+            step_loss += batch_loss
+            step_images += len(items)
             seen += len(items)
             if sync:
+                backbone_lr, head_lr = (group["lr"] for group in optimizer.param_groups)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
+                stats = torch.tensor((step_loss, step_images), device=device, dtype=torch.float64)
+                if world > 1:
+                    dist.all_reduce(stats)
+                if local_rank == 0:
+                    now = time.monotonic()
+                    elapsed = now - started
+                    print(json.dumps({"event": "train_progress", "epoch": epoch + 1,
+                                      "step": step, "total_steps": total_steps,
+                                      "progress": f"{step}/{total_steps}",
+                                      "progress_pct": round(100 * step / total_steps, 1),
+                                      "loss": round((stats[0] / stats[1]).item(), 6),
+                                      "images_per_second": round(stats[1].item() / max(now - last_step, 1e-9), 2),
+                                      "elapsed_seconds": round(elapsed),
+                                      "eta_seconds": round(elapsed / step * (total_steps - step)),
+                                      "backbone_lr": backbone_lr, "head_lr": head_lr}), flush=True)
+                    last_step = now
+                step_loss = step_images = 0
                 if args.save_every_steps and step % args.save_every_steps == 0:
                     if world > 1:
                         dist.barrier()
