@@ -2,18 +2,29 @@
 
 import copy
 import json
+import os
+import random
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 
+from kev.camera import model as camera_model
+from kev.camera import train as camera_train
 from kev.camera.data import CameraImageDataset
 from kev.camera.model import CameraDecisionModel, encode_record, load_camera, pack_record
+from kev.camera.resume import (ResumableBatchSampler, check_resume, data_signature,
+                               find_resume, read_state, restore_rng, rng_state, save_checkpoint)
 from kev.camera.train import datasets, evaluate, first_item, parse_args, train_batch
+from kev.suite import write_json, write_jsonl
 
 
 class TinyTokenizer:
@@ -264,16 +275,14 @@ def test_dataset_preflight_accepts_noul_and_choice_and_catches_image_overlap(tmp
 def test_dataset_preflight_allows_no_validation(tmp_path):
     (tmp_path / "train.jpg").write_bytes(b"image")
     training = tmp_path / "train.jsonl"
-    training.write_text(json.dumps({"image": "train.jpg", "state": "", "questions": {
-        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}) + "\n",
-        encoding="utf-8")
+    write_jsonl(training, [{"image": "train.jpg", "state": "", "questions": {
+        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}])
     args = parse_args(["--train-data", str(training), "--validate-data"])
     train, valid = datasets(args)
     assert len(train) == 1
     assert valid is None
-    training.write_text(json.dumps({"image": "missing.jpg", "state": "", "questions": {
-        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}) + "\n",
-        encoding="utf-8")
+    write_jsonl(training, [{"image": "missing.jpg", "state": "", "questions": {
+        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}])
     with pytest.raises(FileNotFoundError, match="missing.jpg"):
         datasets(args)
 
@@ -286,9 +295,8 @@ def small_worker_pixel_limit(worker_id):
 def test_image_decode_runs_with_cameramodel_pixel_limit(tmp_path, monkeypatch, num_workers):
     Image.new("RGB", (12, 18), (255, 0, 0)).save(tmp_path / "train.png")
     training = tmp_path / "train.jsonl"
-    training.write_text(json.dumps({"image": "train.png", "state": "", "questions": {
-        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}) + "\n",
-        encoding="utf-8")
+    write_jsonl(training, [{"image": "train.png", "state": "", "questions": {
+        "rain": {"type": "noul", "instructions": "Is it raining?", "label": False}}}])
     args = parse_args(["--train-data", str(training), "--validate-data"])
     records, _ = datasets(args)
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 16)
@@ -298,3 +306,292 @@ def test_image_decode_runs_with_cameramodel_pixel_limit(tmp_path, monkeypatch, n
     assert item["pixels"].shape == (1, 3, 32, 32)
     assert item["pixels"][0, 0, 0, 0].item() == pytest.approx((1 - 0.485) / 0.229)
     assert item["record"]["questions"][0]["label"] == 0
+
+
+@pytest.fixture
+def tiny_checkpoints(monkeypatch):
+    """Exercise checkpoint I/O with synthetic tensors, without private CameraAgent code or weights."""
+    from transformers import AutoTokenizer
+
+    class StochasticBackbone(TinyBackbone):
+        def __init__(self):
+            super().__init__()
+            self.dropout = nn.Dropout(0.2)
+
+        def forward(self, **kwargs):
+            output = super().forward(**kwargs)
+            output.last_hidden_state = self.dropout(output.last_hidden_state)
+            return output
+
+    def make_camera():
+        camera = TinyCamera()
+        camera.language_model.model = StochasticBackbone()
+        camera.language_model.model.config = camera.language_model.config
+        camera.config.model_type = "camera_agent"
+        camera.config.template = "internvl2_5"
+        camera.config.ps_version = "v2"
+        camera.config.force_image_size = 8
+        camera.language_model.get_output_embeddings = lambda: None
+        return camera
+
+    def save_camera(self, path, **kwargs):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        write_json(path / "config.json", {
+            "model_type": "camera_agent", "llm_config": {"hidden_size": 4},
+            "force_image_size": 8, "template": "internvl2_5", "ps_version": "v2",
+        })
+        torch.save(self.state_dict(), path / "tiny.pt")
+
+    def load_camera(path, **kwargs):
+        camera = make_camera()
+        camera.load_state_dict(torch.load(Path(path) / "tiny.pt", weights_only=True))
+        return camera
+
+    def save_tokenizer(self, path):
+        (Path(path) / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(TinyCamera, "save_pretrained", save_camera, raising=False)
+    monkeypatch.setattr(TinyTokenizer, "save_pretrained", save_tokenizer, raising=False)
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: TinyTokenizer())
+    monkeypatch.setattr(camera_model, "load_camera", load_camera)
+    monkeypatch.setattr(camera_train, "load_camera", load_camera)
+    return make_camera
+
+
+def test_flat_config_and_legacy_checkpoint_preserve_backbone_head_and_predictions(tmp_path, tiny_checkpoints):
+    model = CameraDecisionModel(tiny_checkpoints(), TinyTokenizer(), head_dim=3, max_length=500).eval()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "modeling_camera_agent.py").write_text("pass\n", encoding="utf-8")
+    flat = tmp_path / "flat"
+    model.save(flat, source=source, image_size=8)
+    config = json.loads((flat / "config.json").read_text(encoding="utf-8"))
+    assert config["model_type"] == "camera_agent"
+    assert config["llm_config"]["hidden_size"] == 4
+    assert config["kev"]["head_dim"] == 3
+    assert config["kev"]["image_size"] == 8
+    assert (flat / "modeling_camera_agent.py").is_file()
+    assert not (flat / "camera").exists()
+    assert not (flat / "camera_decision.json").exists()
+    loaded, _ = camera_model.load(flat, device="cpu", dtype=torch.float32)
+    assert all(torch.equal(value, loaded.state_dict()[key]) for key, value in model.state_dict().items())
+    assert all(torch.equal(a, b) for a, b in zip(model(record(), torch.tensor([1.])),
+                                                loaded(record(), torch.tensor([1.]))))
+
+    legacy = tmp_path / "legacy"
+    model.camera.save_pretrained(legacy / "camera")
+    model.tokenizer.save_pretrained(legacy / "camera")
+    torch.save(model.head.state_dict(), legacy / "pointer.pt")
+    write_json(legacy / "camera_decision.json", {
+        "source": str(source), "format": 1, "head_dim": 3, "image_size": 8, "max_length": 500,
+    })
+    loaded, _ = camera_model.load(legacy, device="cpu", dtype=torch.float32)
+    assert all(torch.equal(value, loaded.state_dict()[key]) for key, value in model.state_dict().items())
+    with pytest.raises(ValueError, match="no training_state.pt"):
+        find_resume(str(legacy), tmp_path)
+
+
+@pytest.fixture
+def cpu_training_control_flow(tmp_path, monkeypatch, tiny_checkpoints):
+    """Run the trainer's control flow on a synthetic CPU model; this does not verify CameraAgent/CUDA."""
+    class CpuTorch:
+        cuda = SimpleNamespace(is_available=lambda: True, is_bf16_supported=lambda: True,
+                               set_device=lambda rank: None)
+
+        def device(self, *args):
+            return torch.device("cpu")
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    monkeypatch.setattr(camera_train, "torch", CpuTorch())
+    real_loader = camera_train.DataLoader
+
+    def cpu_loader(*args, **kwargs):
+        kwargs["pin_memory"] = False
+        return real_loader(*args, **kwargs)
+
+    monkeypatch.setattr(camera_train, "DataLoader", cpu_loader)
+    # Adapt the synthetic visual projector to real image tensor shapes.
+    def extract_feature(self, pixels):
+        value = pixels.flatten(1).mean(-1).reshape(-1, 1, 1)
+        return self.projector(value).expand(-1, 3, 4)
+
+    monkeypatch.setattr(TinyCamera, "extract_feature", extract_feature)
+    raw = tmp_path / "raw"
+    tiny_checkpoints().save_pretrained(raw)
+    training = tmp_path / "train.jsonl"
+    validation = tmp_path / "val.jsonl"
+    rows = []
+    for index in range(6):
+        Image.new("RGB", (8, 8), (index * 30, 100, 200)).save(tmp_path / f"{index}.png")
+        rows.append({"image": f"{index}.png", "state": "", "questions": {
+            "cat": {"type": "noul", "instructions": "Cat?", "label": index % 2 == 0}}})
+    training.write_text("".join(json.dumps(row) + "\n" for row in rows[:5]), encoding="utf-8")
+    validation.write_text(json.dumps(rows[5]) + "\n", encoding="utf-8")
+    args = ["--train-data", str(training), "--val-data", str(validation),
+            "--epochs", "2", "--batch", "2", "--accum", "2", "--image-size", "8",
+            "--head-dim", "3", "--max-length", "500", "--num-workers", "0"]
+    return raw, args
+
+
+def assert_tensor_tree_equal(left, right):
+    if isinstance(left, torch.Tensor):
+        assert torch.equal(left, right)
+    elif isinstance(left, dict):
+        assert left.keys() == right.keys()
+        for key in left:
+            assert_tensor_tree_equal(left[key], right[key])
+    elif isinstance(left, (tuple, list)):
+        assert len(left) == len(right)
+        for a, b in zip(left, right):
+            assert_tensor_tree_equal(a, b)
+    else:
+        assert left == right
+
+
+@pytest.mark.parametrize("stop_step,workers", [(1, 0), (2, 0), (4, 0), (1, 2)])
+def test_resume_control_flow_matches_uninterrupted_with_dropout_and_partial_batches(
+        tmp_path, cpu_training_control_flow, stop_step, workers):
+    raw, args = cpu_training_control_flow
+    args = [*args, "--num-workers", str(workers)]
+    baseline, resumed = tmp_path / "baseline", tmp_path / "resumed"
+    camera_train.main([*args, "--model", str(raw), "--out", str(baseline)])
+    camera_train.main([*args, "--model", str(raw), "--out", str(resumed), "--stop-after", str(stop_step)])
+    # A failed checkpoint write is hidden and must never become the latest resume point.
+    (resumed / ".checkpoint-9999999-interrupted").mkdir()
+    checkpoint = find_resume("latest", resumed)
+    assert checkpoint.name == f"checkpoint-{stop_step:07d}"
+    camera_train.main([*args, "--resume", "latest", "--out", str(resumed)])
+    expected, _ = camera_model.load(baseline / "final", device="cpu")
+    actual, _ = camera_model.load(resumed / "final", device="cpu")
+    assert_tensor_tree_equal(actual.state_dict(), expected.state_dict())
+    expected_state, actual_state = read_state(baseline / "final"), read_state(resumed / "final")
+    assert expected_state["step"] == actual_state["step"] == 4
+    assert_tensor_tree_equal(expected_state["optimizer"], actual_state["optimizer"])
+    assert_tensor_tree_equal(expected_state["scheduler"], actual_state["scheduler"])
+    assert (baseline / "training_metrics.jsonl").read_bytes() == (resumed / "training_metrics.jsonl").read_bytes()
+    camera_train.main([*args, "--resume", "latest", "--out", str(resumed)])
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_checkpoint_initializes_a_new_run_with_the_saved_head(tmp_path, cpu_training_control_flow, monkeypatch, legacy):
+    raw, args = cpu_training_control_flow
+    original = tmp_path / "original"
+    camera_train.main([*args, "--model", str(raw), "--out", str(original)])
+    saved, _ = camera_model.load(original / "final", device="cpu")
+    checkpoint = original / "final"
+    if legacy:
+        checkpoint = tmp_path / "legacy"
+        saved.camera.save_pretrained(checkpoint / "camera")
+        saved.tokenizer.save_pretrained(checkpoint / "camera")
+        torch.save(saved.head.state_dict(), checkpoint / "pointer.pt")
+        write_json(checkpoint / "camera_decision.json", {
+            "source": str(raw), "format": 1, "head_dim": 3, "image_size": 8, "max_length": 500,
+        })
+    real_batch = camera_train.train_batch
+    seen = []
+
+    def check_first_batch(model, *args, **kwargs):
+        if not seen:
+            assert_tensor_tree_equal(model.state_dict(), saved.state_dict())
+        seen.append(True)
+        return real_batch(model, *args, **kwargs)
+
+    monkeypatch.setattr(camera_train, "train_batch", check_first_batch)
+    # No shape arguments: the new run must inherit the checkpoint's non-default settings.
+    args = [arg for index, arg in enumerate(args)
+            if arg not in ("--head-dim", "--image-size", "--max-length")
+            and (index == 0 or args[index - 1] not in ("--head-dim", "--image-size", "--max-length"))]
+    camera_train.main([*args, "--checkpoint", str(checkpoint), "--out", str(tmp_path / "new"),
+                       "--stop-after", "1"])
+    assert seen
+    state = read_state(tmp_path / "new" / "checkpoint-0000001")
+    assert state["step"] == 1
+    assert (state["args"]["head_dim"], state["args"]["image_size"], state["args"]["max_length"]) == (3, 8, 500)
+    with pytest.raises(ValueError, match="raw CameraAgent"):
+        camera_train.main([*args, "--model", str(original / "final"), "--out", str(tmp_path / "wrong")])
+
+
+def test_rng_restore_includes_python_numpy_and_torch():
+    state = rng_state()
+    expected = (random.random(), np.random.rand(), torch.rand(5))
+    restore_rng(state)
+    assert random.random() == expected[0]
+    assert np.random.rand() == expected[1]
+    assert torch.equal(torch.rand(5), expected[2])
+
+
+def test_failed_checkpoint_write_cannot_be_selected_as_latest(tmp_path):
+    class BrokenModel:
+        def save(self, path, **kwargs):
+            (path / "pointer.pt").write_bytes(b"incomplete")
+            raise OSError("disk full")
+
+    target = tmp_path / "checkpoint-0000001"
+    with pytest.raises(OSError, match="disk full"):
+        save_checkpoint(target, BrokenModel(), None, None, args=SimpleNamespace(image_size=8),
+                        source=tmp_path, world=1, rank=0, signature=[], total_steps=2,
+                        step=1, epoch=0, next_batch=1, train_loss=1.0, seen=1)
+    assert not target.exists()
+    with pytest.raises(FileNotFoundError, match="no complete"):
+        find_resume("latest", tmp_path)
+
+
+def test_resume_rejects_changed_training_and_data(tmp_path, cpu_training_control_flow):
+    raw, args = cpu_training_control_flow
+    out = tmp_path / "run"
+    camera_train.main([*args, "--model", str(raw), "--out", str(out), "--stop-after", "1"])
+    state = read_state(find_resume("latest", out))
+    parsed = SimpleNamespace(**state["args"])
+    signature = data_signature(*datasets(parsed))
+    check_resume(state, parsed, world=1, signature=signature, total_steps=4)
+    for field, value in (("lr", 0.001), ("accum", 1), ("epochs", 3), ("freeze_llm", True)):
+        changed = copy.copy(parsed)
+        setattr(changed, field, value)
+        with pytest.raises(ValueError, match="settings changed"):
+            check_resume(state, changed, world=1, signature=signature, total_steps=4)
+    with pytest.raises(ValueError, match="WORLD_SIZE"):
+        check_resume(state, parsed, world=2, signature=signature, total_steps=4)
+    Path(parsed.train_data).write_text(Path(parsed.train_data).read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="annotations"):
+        check_resume(state, parsed, world=1, signature=data_signature(*datasets(parsed)), total_steps=4)
+
+
+def test_resume_sampler_skips_batches_before_decoding_images():
+    class Records:
+        def __getitem__(self, index):
+            assert index >= 4
+            return index
+
+    sampler = ResumableBatchSampler(range(7), batch_size=2, drop_last=False)
+    sampler.start = 2
+    assert len(sampler) == 2
+    assert [batch.tolist() for batch in DataLoader(Records(), batch_sampler=sampler)] == [[4, 5], [6]]
+
+
+@pytest.mark.parametrize("script,mode", [
+    ("train_camera_kev.sh", "base"), ("train_camera_kev_from_ckpt.sh", "checkpoint"),
+    ("train_camera_kev.sh", "resume"), ("train_camera_kev_from_ckpt.sh", "resume"),
+])
+def test_camera_shell_entrypoints_select_one_source(tmp_path, script, mode):
+    launcher = tmp_path / "torchrun"
+    launcher.write_bytes(f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n".encode("utf-8"))
+    launcher.chmod(0o755)
+    model = tmp_path / "model"
+    model.mkdir()
+    env = {**os.environ, "TORCHRUN": str(launcher), "TRAIN_DATA": "/data/train.jsonl", "TRAIN_META": "",
+           "CAMERA_CODE_DIR": "", "OUTPUT_DIR": str(tmp_path / "out"), "RESUME": "",
+           "MODEL_NAME_OR_PATH": str(model), "CAMERA_CHECKPOINT": str(model),
+           "IMAGE_SIZE": "", "MAX_LENGTH": "", "HEAD_DIM": ""}
+    if mode == "resume":
+        env["RESUME"] = "latest"
+        env["MODEL_NAME_OR_PATH"] = "/missing/original/base"
+        env["CAMERA_CHECKPOINT"] = ""
+    result = subprocess.run(["bash", f"shell/{script}"], env=env, capture_output=True, text=True, check=True)
+    argv = json.loads(result.stdout)
+    flag = {"base": "--model", "checkpoint": "--checkpoint", "resume": "--resume"}[mode]
+    assert argv[argv.index(flag) + 1] == ("latest" if mode == "resume" else str(model))
+    assert sum(arg in ("--model", "--checkpoint", "--resume") for arg in argv) == 1
+    assert "--head-dim" not in argv
