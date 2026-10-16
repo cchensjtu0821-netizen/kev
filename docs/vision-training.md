@@ -11,6 +11,8 @@ Kev's published checkpoints came from these stages. Their text API and scores do
 
 This experimental path adds a ViT and a two-layer MLP projector. It follows CameraModel's ViT, projector and language-model layout and reads its `root` / `annotation` / `repeat_time` data collection format. Kev's pointer head still scores supplied options. It does not generate captions. ViT patch tokens enter the common state after Kev's state marker; each question then runs as an isolated causal row.
 
+For the existing 0.4B dense `CameraAgentModel` checkpoint, use the separate [CameraAgent pointer path](camera-kev.md). It loads that model's own vision encoder, projector and Qwen3 weights and accepts both `noul` and mixed `noul`/`choice` image records.
+
 CameraModel's checked-in launcher points to image and annotation files on a separate machine. They are not in this checkout. Its general `conversations` rows have free-form answers, which do not provide reliable labels for Kev's option probabilities. Add labelled `questions` to the rows you train on. Keep MMBench dev and AesBench val for evaluation, not training. The existing [camera benchmark guide](camera-bench.md) evaluates released text checkpoints through independent captions; it measures a different, two-stage system.
 
 ## Data

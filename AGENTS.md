@@ -10,6 +10,14 @@ docs/autoresearch.md (the operating program for an unattended research session) 
 checkpoint: recipe + metrics). README follows the Vercel Labs house style (tagline, for-the-badge badges, Highlights,
 Title Case sections, API tables, Authors + License); model cards are formal.
 
+## Current CameraAgent workspace
+
+This server is a remote, code-only workspace. It has no VLM training data, CameraAgent 0.4B checkpoint, GPU, or prepared
+CameraModel Python environment. The `/srv/workspace/...` paths in the CameraAgent launcher refer to another machine and
+are not available here. The user must pull the Kev and CameraAgent code, model files, and datasets to their local GPU
+machine and set up its dependencies before starting `shell/train_camera_kev.sh`. On this server, only static checks are
+possible; do not report CameraAgent training, inference, or weight-backed tests as verified here.
+
 ## Commands
 - Env: `uv sync` (add `--extra serve` for FastAPI + the TypeSafe SDK; on Apple Silicon it also pulls `mlx-lm` for the MLX backend, `--extra mlx` alone for library use). `kev` is a real package (setuptools, installed
   editable by `uv sync` since #14), Python 3.12 or 3.13 (`requires-python = ">=3.12,<3.14"`; 3.14 has no wheels for the pinned torch, `.python-version` selects 3.13,
