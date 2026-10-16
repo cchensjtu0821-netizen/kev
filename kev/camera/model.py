@@ -1,6 +1,5 @@
 """Read CameraAgent image features with Kev's option pointer head."""
 
-import json
 import shutil
 from pathlib import Path
 
@@ -9,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kev.model import PointerHead, branch_mask_batch, user_tokens
+from kev.suite import read_json, write_json
 
 
 IMAGE_MEAN = (0.485, 0.456, 0.406)
@@ -198,27 +198,48 @@ class CameraDecisionModel(nn.Module):
     def save(self, path, *, source, image_size):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        self.camera.save_pretrained(path / "camera", safe_serialization=True)
-        self.tokenizer.save_pretrained(path / "camera")
+        self.camera.save_pretrained(path, safe_serialization=True)
+        self.tokenizer.save_pretrained(path)
         if Path(source).is_dir():
             for code in Path(source).glob("*.py"):
-                shutil.copy2(code, path / "camera" / code.name)
+                if code.resolve() != (path / code.name).resolve():
+                    shutil.copy2(code, path / code.name)
         torch.save(self.head.state_dict(), path / "pointer.pt")
-        (path / "camera_decision.json").write_text(json.dumps({
+        config_path = path / "config.json"
+        config = read_json(config_path)
+        config["kev"] = {
             "source": str(source), "image_size": image_size, "head_dim": self.head.q.out_features,
-            "max_length": self.max_length, "format": 1,
-        }, indent=2) + "\n", encoding="utf-8")
+            "max_length": self.max_length, "format": 2, "head_type": "pointer",
+            "head_weights": "pointer.pt", "image_mean": IMAGE_MEAN, "image_std": IMAGE_STD,
+            "image_tiles": 1, "question_attention": "block_causal",
+        }
+        write_json(config_path, config)
+
+
+def checkpoint_config(path):
+    """Return the backbone directory and Kev settings for either checkpoint format."""
+    path = Path(path)
+    if (path / "camera_decision.json").is_file():
+        metadata = read_json(path / "camera_decision.json")
+        if metadata["format"] != 1:
+            raise ValueError(f"unsupported Camera Kev checkpoint format: {metadata['format']}")
+        return path / "camera", metadata
+    config = read_json(path / "config.json")
+    metadata = config.get("kev")
+    if not metadata or metadata.get("format") != 2:
+        raise ValueError(f"{path} is not a Camera Kev checkpoint; use --model for a raw CameraAgent")
+    return path, metadata
 
 
 def load(path, *, device="cuda", dtype=torch.bfloat16):
     from transformers import AutoTokenizer
 
     path = Path(path)
-    metadata = json.loads((path / "camera_decision.json").read_text(encoding="utf-8"))
-    base = path / "camera"
+    base, metadata = checkpoint_config(path)
     tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True, use_fast=False)
     camera = load_camera(base, dtype=dtype).to(device)
     model = CameraDecisionModel(camera, tokenizer, head_dim=metadata["head_dim"],
                                 max_length=metadata["max_length"]).to(device)
-    model.head.load_state_dict(torch.load(path / "pointer.pt", map_location="cpu", weights_only=True))
+    model.head.load_state_dict(torch.load(path / metadata.get("head_weights", "pointer.pt"),
+                                         map_location="cpu", weights_only=True))
     return model.eval(), metadata
