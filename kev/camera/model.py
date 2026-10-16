@@ -15,6 +15,23 @@ IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 
 
+def load_camera(path, *, dtype=torch.bfloat16):
+    """Configure the nested Qwen model before CameraAgent constructs it."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(path, trust_remote_code=True)
+    text_config = config.llm_config
+    if isinstance(text_config, dict):
+        text_config.update(_attn_implementation="eager", attn_implementation="eager")
+    else:
+        text_config._attn_implementation = "eager"
+        text_config.attn_implementation = "eager"
+    return AutoModelForCausalLM.from_pretrained(
+        path, config=config, trust_remote_code=True, dtype=dtype,
+        attn_implementation="eager", use_flash_attn=False,
+    )
+
+
 def image_tensor(image, size=384):
     """CameraModel's fixed-size, single-tile ImageNet normalization path."""
     from PIL import Image
@@ -93,6 +110,14 @@ class CameraDecisionModel(nn.Module):
         language = camera.language_model
         if not hasattr(language, "model") or not hasattr(language, "get_input_embeddings"):
             raise TypeError("CameraAgent language_model must expose model and get_input_embeddings")
+        for name, module in language.named_modules():
+            if name not in ("", "model") and not name.endswith(".self_attn"):
+                continue
+            implementation = getattr(module.config, "_attn_implementation", None)
+            if implementation != "eager":
+                raise ValueError(f"CameraAgent {name or 'language_model'} uses attention backend "
+                                 f"{implementation!r}; the 4D question-branch mask requires eager. "
+                                 "Load with load_camera() to configure llm_config and use_flash_attn=False.")
         llm_config = camera.config.llm_config
         hidden_size = llm_config["hidden_size"] if isinstance(llm_config, dict) else llm_config.hidden_size
         self.head = PointerHead(hidden_size, head_dim)
@@ -186,14 +211,13 @@ class CameraDecisionModel(nn.Module):
 
 
 def load(path, *, device="cuda", dtype=torch.bfloat16):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     path = Path(path)
     metadata = json.loads((path / "camera_decision.json").read_text(encoding="utf-8"))
     base = path / "camera"
     tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True, use_fast=False)
-    camera = AutoModelForCausalLM.from_pretrained(
-        base, trust_remote_code=True, dtype=dtype, attn_implementation="eager").to(device)
+    camera = load_camera(base, dtype=dtype).to(device)
     model = CameraDecisionModel(camera, tokenizer, head_dim=metadata["head_dim"],
                                 max_length=metadata["max_length"]).to(device)
     model.head.load_state_dict(torch.load(path / "pointer.pt", map_location="cpu", weights_only=True))

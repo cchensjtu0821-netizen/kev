@@ -12,7 +12,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from kev.camera.data import CameraImageDataset
-from kev.camera.model import CameraDecisionModel, encode_record, pack_record
+from kev.camera.model import CameraDecisionModel, encode_record, load_camera, pack_record
 from kev.camera.train import datasets, evaluate, first_item, parse_args, train_batch
 
 
@@ -50,6 +50,8 @@ class TinyLanguage(nn.Module):
         super().__init__()
         self.model = TinyBackbone()
         self.embeddings = nn.Embedding(128, 4)
+        self.config = SimpleNamespace(hidden_size=4, _attn_implementation="eager")
+        self.model.config = self.config
 
     def get_input_embeddings(self):
         return self.embeddings
@@ -60,10 +62,10 @@ class TinyCamera(nn.Module):
         super().__init__()
         self.language_model = TinyLanguage()
         self.projector = nn.Linear(1, 4)
-        self.config = SimpleNamespace(llm_config=SimpleNamespace(hidden_size=4))
+        self.config = SimpleNamespace(llm_config=self.language_model.config)
 
     def extract_feature(self, pixels):
-        return self.projector(pixels.reshape(-1, 1, 1)).expand(-1, 3, 4)
+        return self.projector(pixels.reshape(-1, 1, 1)).expand(-1, 3, self.projector.out_features)
 
 
 def record():
@@ -71,6 +73,79 @@ def record():
         {"instr": "Is there a cat?", "options": ["no", "yes"], "label": 1},
         {"instr": "Which colour?", "options": ["red", "blue", "none"], "label": 0},
     ]}
+
+
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_camera_loader_configures_nested_attention_before_model_construction(monkeypatch, as_dict):
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    text_config = {"_attn_implementation": "flash_attention_2", "attn_implementation": "flash_attention_2"}
+    if not as_dict:
+        text_config = SimpleNamespace(**text_config)
+    config = SimpleNamespace(llm_config=text_config)
+    camera = TinyCamera()
+
+    def load_config(path, **kwargs):
+        assert path == "camera-checkpoint"
+        assert kwargs == {"trust_remote_code": True}
+        return config
+
+    def load_model(path, **kwargs):
+        assert path == "camera-checkpoint"
+        assert kwargs["config"] is config
+        values = text_config if as_dict else vars(text_config)
+        assert values["_attn_implementation"] == values["attn_implementation"] == "eager"
+        assert kwargs["attn_implementation"] == "eager"
+        assert kwargs["use_flash_attn"] is False
+        assert kwargs["dtype"] == torch.bfloat16
+        return camera
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", load_config)
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load_model)
+    assert load_camera("camera-checkpoint") is camera
+
+
+@pytest.mark.parametrize("target", ["language", "backbone", "attention"])
+def test_camera_rejects_nested_flash_attention_before_forward(target):
+    camera = TinyCamera()
+    camera.config._attn_implementation = "eager"
+    if target == "language":
+        module = camera.language_model
+    elif target == "backbone":
+        module = camera.language_model.model
+    else:
+        camera.language_model.model.self_attn = nn.Module()
+        module = camera.language_model.model.self_attn
+    module.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    with pytest.raises(ValueError, match="4D question-branch mask requires eager"):
+        CameraDecisionModel(camera, TinyTokenizer())
+
+
+def test_qwen3_eager_packed_questions_match_rows_with_checkpointing():
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    torch.manual_seed(8)
+    config = Qwen3Config(vocab_size=128, hidden_size=16, intermediate_size=32,
+                         num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+                         head_dim=8, bos_token_id=1, eos_token_id=0, pad_token_id=0,
+                         attention_dropout=0.0)
+    config._attn_implementation = "eager"
+    camera = TinyCamera()
+    camera.language_model = Qwen3ForCausalLM(config)
+    camera.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    camera.config.llm_config = camera.language_model.config
+    camera.projector = nn.Linear(1, 16)
+    model = CameraDecisionModel(camera, TinyTokenizer(), head_dim=3, max_length=500).train()
+    rows = [record(), {"state": "longer state", "questions": record()["questions"][:1]}]
+    pixels = torch.tensor([1.0, 2.0])
+    batched = model(rows, pixels)
+    for index, row in enumerate(rows):
+        direct = model(row, pixels[index:index + 1])
+        for actual, expected in zip(batched[index], direct):
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    sum(z.square().sum() for group in batched for z in group).backward()
+    assert torch.isfinite(camera.projector.weight.grad).all()
+    assert camera.projector.weight.grad.abs().sum() > 0
 
 
 def test_camera_pointer_keeps_questions_isolated_and_trains_visual_path():

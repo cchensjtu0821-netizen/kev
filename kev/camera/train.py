@@ -6,6 +6,7 @@ import math
 import os
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from kev.vision_data import ImageDecisionDataset
 
 from .data import CameraImageDataset
-from .model import CameraDecisionModel
+from .model import CameraDecisionModel, load_camera
 
 
 def datasets(args):
@@ -135,7 +136,7 @@ def main(argv=None):
         raise FileExistsError(f"output already exists: {args.out}")
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("CameraAgent training needs a CUDA GPU with bf16 support")
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -145,10 +146,7 @@ def main(argv=None):
     device = torch.device("cuda", local_rank)
     torch.manual_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
-    camera = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, dtype=torch.bfloat16,
-        attn_implementation="eager",
-    )
+    camera = load_camera(args.model)
     config = camera.config
     if getattr(config, "model_type", None) != "camera_agent":
         raise ValueError("--model must point to a camera_agent checkpoint")
@@ -201,8 +199,9 @@ def main(argv=None):
     step_loss = step_images = 0
     if local_rank == 0:
         print(json.dumps({"event": "train_start", "images": len(train_images), "epochs": args.epochs,
-                          "total_steps": total_steps, "gpus": world, "batch_per_gpu": args.batch,
-                          "accum": args.accum}), flush=True)
+                          "progress": f"0/{total_steps}", "gpus": world, "batch_per_gpu": args.batch,
+                          "accum": args.accum,
+                          "attention_backend": camera.language_model.config._attn_implementation}), flush=True)
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(args.epochs):
         if sampler is not None:
@@ -235,13 +234,12 @@ def main(argv=None):
                     now = time.monotonic()
                     elapsed = now - started
                     print(json.dumps({"event": "train_progress", "epoch": epoch + 1,
-                                      "step": step, "total_steps": total_steps,
                                       "progress": f"{step}/{total_steps}",
                                       "progress_pct": round(100 * step / total_steps, 1),
                                       "loss": round((stats[0] / stats[1]).item(), 6),
                                       "images_per_second": round(stats[1].item() / max(now - last_step, 1e-9), 2),
-                                      "elapsed_seconds": round(elapsed),
-                                      "eta_seconds": round(elapsed / step * (total_steps - step)),
+                                      "elapsed": str(timedelta(seconds=round(elapsed))),
+                                      "eta": str(timedelta(seconds=round(elapsed / step * (total_steps - step)))),
                                       "backbone_lr": backbone_lr, "head_lr": head_lr}), flush=True)
                     last_step = now
                 step_loss = step_images = 0
