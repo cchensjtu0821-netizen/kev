@@ -131,7 +131,8 @@ def load(path, *, device="cuda", dtype=torch.bfloat16):
     metadata = json.loads((path / "camera_decision.json").read_text(encoding="utf-8"))
     base = path / "camera"
     tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True, use_fast=False)
-    camera = AutoModelForCausalLM.from_pretrained(base, trust_remote_code=True, dtype=dtype).to(device)
+    camera = AutoModelForCausalLM.from_pretrained(
+        base, trust_remote_code=True, dtype=dtype, attn_implementation="eager").to(device)
     model = CameraDecisionModel(camera, tokenizer, head_dim=metadata["head_dim"],
                                 max_length=metadata["max_length"]).to(device)
     model.head.load_state_dict(torch.load(path / "pointer.pt", map_location="cpu", weights_only=True))

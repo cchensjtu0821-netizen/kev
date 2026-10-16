@@ -127,7 +127,7 @@ def main(argv=None):
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
     camera = AutoModelForCausalLM.from_pretrained(
         args.model, trust_remote_code=True, dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",
     )
     config = camera.config
     if getattr(config, "model_type", None) != "camera_agent":
