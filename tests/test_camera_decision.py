@@ -595,3 +595,100 @@ def test_camera_shell_entrypoints_select_one_source(tmp_path, script, mode):
     assert argv[argv.index(flag) + 1] == ("latest" if mode == "resume" else str(model))
     assert sum(arg in ("--model", "--checkpoint", "--resume") for arg in argv) == 1
     assert "--head-dim" not in argv
+
+
+@pytest.mark.parametrize("script,rank,gpus,batch", [
+    ("train_camera_kev_lora.sh", 64, 8, 16),
+    ("train_camera_kev_lora_goutu.sh", 64, 8, 16),
+    ("train_camera_kev_lora_seka.sh", 128, 4, 8),
+])
+def test_camera_lora_shell_defaults_and_resume(tmp_path, script, rank, gpus, batch):
+    launcher = tmp_path / "torchrun"
+    launcher.write_text(f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    model = tmp_path / "model"
+    model.mkdir()
+    env = {"PATH": os.environ["PATH"], "TORCHRUN": str(launcher), "MODEL_NAME_OR_PATH": str(model),
+           "META_PATH": "/data/kev-collection.json", "OUTPUT_DIR": str(tmp_path / "out")}
+    for resume in (False, True):
+        if resume:
+            env.update(RESUME="latest", MODEL_NAME_OR_PATH="/missing/base")
+        result = subprocess.run(["bash", str(Path(__file__).resolve().parents[1] / "shell/lora" / script),
+                                 "--max-steps", "1"], cwd=tmp_path, env=env,
+                                capture_output=True, text=True, check=True)
+        argv = json.loads(result.stdout)
+        assert argv[argv.index("--lora-r") + 1] == str(rank)
+        assert f"--nproc-per-node={gpus}" in argv
+        assert argv[argv.index("--batch") + 1] == str(batch)
+        assert argv[argv.index("--accum") + 1] == "1"
+        assert argv[argv.index("--train-meta") + 1] == "/data/kev-collection.json"
+        assert argv[argv.index("--lr") + 1] == "1e-4"
+        assert argv[-2:] == ["--max-steps", "1"]
+        flag = "--resume" if resume else "--model"
+        assert argv[argv.index(flag) + 1] == ("latest" if resume else str(model))
+        assert sum(arg in ("--model", "--checkpoint", "--resume") for arg in argv) == 1
+
+
+def test_camera_lora_roundtrip_preserves_frozen_base_and_updated_adapter(tmp_path, tiny_checkpoints, monkeypatch):
+    """Synthetic Qwen tensors exercise PEFT gradients and the standalone save format."""
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    from kev.camera import lora
+
+    def make_camera():
+        camera = tiny_checkpoints()
+        config = Qwen3Config(vocab_size=128, hidden_size=16, intermediate_size=32,
+                             num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
+                             head_dim=8, bos_token_id=1, eos_token_id=0, pad_token_id=0)
+        config._attn_implementation = "eager"
+        camera.language_model = Qwen3ForCausalLM(config)
+        camera.config.llm_config = config
+        camera.projector = nn.Linear(1, 16)
+        return camera
+
+    def save_camera(self, path, *, state_dict=None, **kwargs):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        write_json(path / "config.json", {"model_type": "camera_agent", "llm_config": {"hidden_size": 16}})
+        torch.save(self.state_dict() if state_dict is None else state_dict, path / "tiny.pt")
+
+    def load_camera(path, **kwargs):
+        camera = make_camera()
+        camera.load_state_dict(torch.load(Path(path) / "tiny.pt", weights_only=True), strict=True)
+        return camera
+
+    monkeypatch.setattr(TinyCamera, "save_pretrained", save_camera)
+    monkeypatch.setattr(camera_model, "load_camera", load_camera)
+    model = CameraDecisionModel(make_camera(), TinyTokenizer(), head_dim=3, max_length=500)
+    base = {name: value.clone() for name, value in model.camera.state_dict().items()}
+    lora.attach(model, 2)
+    model.camera.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    trainable = {name for name, value in model.named_parameters() if value.requires_grad}
+    assert any("lora_" in name for name in trainable)
+    assert all("lora_" in name or name.startswith("head.") for name in trainable)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.01)
+    model.train()
+    logits = model([record()], torch.tensor([1.0]))[0]
+    sum(F.cross_entropy(z.unsqueeze(0), torch.tensor([q["label"]]))
+        for q, z in zip(record()["questions"], logits)).backward()
+    assert any(value.grad is not None and value.grad.abs().sum() > 0
+               for name, value in model.named_parameters() if "lora_B" in name)
+    assert all(value.grad is None for name, value in model.camera.named_parameters() if "lora_" not in name)
+    optimizer.step()
+    model.eval()
+    expected = model.probabilities(record(), torch.tensor([1.0]))
+    path = tmp_path / "checkpoint"
+    model.save(path, source=tmp_path / "absent-original-base", image_size=8)
+    saved_base = torch.load(path / "tiny.pt", weights_only=True)
+    assert_tensor_tree_equal(saved_base, base)
+    loaded, metadata = camera_model.load(path, device="cpu", dtype=torch.float32)
+    assert metadata["lora_rank"] == 2
+    assert loaded.lora_rank == 2
+    actual = loaded.probabilities(record(), torch.tensor([1.0]))
+    for left, right in zip(actual, expected):
+        torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("options", [["--lora-r", "-1"], ["--lora-r", "2", "--freeze-llm"]])
+def test_camera_lora_rejects_invalid_trainability(options):
+    with pytest.raises(SystemExit):
+        parse_args(["--train-data", "/data/train.jsonl", *options])

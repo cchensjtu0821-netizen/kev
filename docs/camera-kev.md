@@ -49,6 +49,36 @@ Training and prediction share an image reader that sets `PIL.Image.MAX_IMAGE_PIX
 
 This trainer uses PyTorch distributed data parallel instead of the source script's DeepSpeed ZeRO-2 and packed generative loss. It loads the checkpoint's language model and its LM head, but does not run the LM head or generate text. The LM head is frozen. `train_camera_kev.sh` starts from a raw CameraAgent with a new random Kev pointer head. The head reads option-boundary hidden states and trains together with the selected CameraAgent weights. Passing a Kev checkpoint through `--model` is refused so that its trained decision head cannot be silently discarded.
 
+## LoRA from the dense 0.4B model
+
+The launchers under `shell/lora/` follow CameraModel's LoRA settings while using the dense 0.4B checkpoint and Kev's decision loss. They freeze all CameraAgent base weights, including the vision encoder, projector, embeddings and LM head. They train only Qwen attention `q_proj`, `k_proj`, `v_proj`, `o_proj` adapters and the Kev pointer head. LoRA alpha is twice the rank and dropout is 0.05. No vocabulary entries are added.
+
+```bash
+MODEL_NAME_OR_PATH=/data/models/camera-agent-04b \
+  TRAIN_META=/data/kev/goutu.json \
+  OUTPUT_DIR=/data/runs/kev-lora-goutu \
+  bash shell/lora/train_camera_kev_lora_goutu.sh
+
+MODEL_NAME_OR_PATH=/data/models/camera-agent-04b \
+  TRAIN_META=/data/kev/seka.json \
+  OUTPUT_DIR=/data/runs/kev-lora-seka \
+  bash shell/lora/train_camera_kev_lora_seka.sh
+
+# Generic launcher, with one GPU and a one-step integration check.
+CUDA_VISIBLE_DEVICES=0 GPUS=1 PER_DEVICE_BATCH_SIZE=1 \
+  TRAIN_DATA=/data/train.jsonl MODEL_NAME_OR_PATH=/data/models/camera-agent-04b \
+  OUTPUT_DIR=/data/runs/kev-lora-check MAX_STEPS=1 \
+  bash shell/lora/train_camera_kev_lora.sh
+```
+
+Goutu defaults to eight GPUs, batch 16 per GPU and rank 64. Seka defaults to GPUs 4-7, batch 8 per GPU and rank 128. Both use accumulation 1, three epochs, adapter and head learning rates of `1e-4`, and save every 2,000 steps. Override these with the same environment variables as the full-weight launcher plus `LORA_R`. `META_PATH` aliases `TRAIN_META`, and `NUM_TRAIN_EPOCHS` aliases `EPOCHS`. The collection's annotations must contain Kev image decision records as described above; CameraModel's generative conversation annotations need conversion first. Set validation data explicitly if needed.
+
+Python also accepts `--lora-r 64`. A positive rank freezes the entire CameraAgent even without `--freeze-*` flags. Omit `FREEZE_LLM` and `--freeze-llm`, which would also freeze the adapters. The launcher uses Kev's existing DDP, bf16 and eager block-causal attention path. It does not use CameraModel's MoE objectives, DeepSpeed or generative packing plan. Batch defaults follow the reference scripts and still need a GPU memory check with the actual question count.
+
+LoRA checkpoints include the original unmerged CameraAgent weights, `llm_adapter/` and `pointer.pt`; `config.json` records `kev.lora_rank`. They load without the original base directory through the same prediction and checkpoint commands. The base and adapter remain separate so saving does not round a merged update into bf16. `--checkpoint` inherits the saved rank; `--resume` also restores the optimizer and RNG. For the LoRA shell launcher, keep `LORA_R` and all training settings the same when setting `RESUME=latest`. The full-weight checkpoint launcher can continue a LoRA checkpoint without specifying `LORA_R`. `peft` must be installed in the CameraModel Python environment.
+
+These scripts and Python modules have only been checked statically in this remote workspace. Run the one-step check on the GPU machine with the dense checkpoint and training data before starting a full run.
+
 ## Checkpoint format
 
 Each new `checkpoint-0002500/` and `final/` directory contains a complete model and training state:
