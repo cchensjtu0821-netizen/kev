@@ -121,6 +121,7 @@ class CameraDecisionModel(nn.Module):
         llm_config = camera.config.llm_config
         hidden_size = llm_config["hidden_size"] if isinstance(llm_config, dict) else llm_config.hidden_size
         self.head = PointerHead(hidden_size, head_dim)
+        self.lora_rank = 0
 
     def _features(self, pixels):
         visual = self.camera.extract_feature(pixels)
@@ -198,7 +199,12 @@ class CameraDecisionModel(nn.Module):
     def save(self, path, *, source, image_size):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        self.camera.save_pretrained(path, safe_serialization=True)
+        if self.lora_rank:
+            from . import lora
+
+            lora.save(self, path)
+        else:
+            self.camera.save_pretrained(path, safe_serialization=True)
         self.tokenizer.save_pretrained(path)
         if Path(source).is_dir():
             for code in Path(source).glob("*.py"):
@@ -213,6 +219,8 @@ class CameraDecisionModel(nn.Module):
             "head_weights": "pointer.pt", "image_mean": IMAGE_MEAN, "image_std": IMAGE_STD,
             "image_tiles": 1, "question_attention": "block_causal",
         }
+        if self.lora_rank:
+            config["kev"]["lora_rank"] = self.lora_rank
         write_json(config_path, config)
 
 
@@ -240,6 +248,10 @@ def load(path, *, device="cuda", dtype=torch.bfloat16):
     camera = load_camera(base, dtype=dtype).to(device)
     model = CameraDecisionModel(camera, tokenizer, head_dim=metadata["head_dim"],
                                 max_length=metadata["max_length"]).to(device)
+    if metadata.get("lora_rank"):
+        from . import lora
+
+        lora.attach(model, metadata["lora_rank"], adapter=path / "llm_adapter")
     model.head.load_state_dict(torch.load(path / metadata.get("head_weights", "pointer.pt"),
                                          map_location="cpu", weights_only=True))
     return model.eval(), metadata

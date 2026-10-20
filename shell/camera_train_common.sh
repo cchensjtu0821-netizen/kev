@@ -96,6 +96,7 @@ shape_args=()
 if [[ -n "${MAX_LENGTH:-}" ]]; then shape_args+=(--max-length "${MAX_LENGTH}"); fi
 if [[ -n "${IMAGE_SIZE:-}" ]]; then shape_args+=(--image-size "${IMAGE_SIZE}"); fi
 if [[ -n "${HEAD_DIM:-}" ]]; then shape_args+=(--head-dim "${HEAD_DIM}"); fi
+if [[ -n "${LORA_R:-}" ]]; then shape_args+=(--lora-r "${LORA_R}"); fi
 
 "${TORCHRUN}" --nnodes=1 --node-rank=0 --master-addr=127.0.0.1 \
   --nproc-per-node="${GPUS}" --master-port="${MASTER_PORT}" -m kev.camera.train \

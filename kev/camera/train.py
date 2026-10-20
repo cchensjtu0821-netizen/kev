@@ -21,6 +21,7 @@ from kev.vision_data import ImageDecisionDataset
 from kev.suite import read_json, read_jsonl, write_jsonl
 
 from .data import CameraImageDataset
+from . import lora
 from .model import CameraDecisionModel, checkpoint_config, load, load_camera
 from .resume import (ResumableBatchSampler, check_resume, data_signature, find_resume,
                      read_state, restore_rng, save_checkpoint)
@@ -99,6 +100,7 @@ def parse_args(argv=None):
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--freeze-llm", action="store_true")
     parser.add_argument("--freeze-mlp", action="store_true")
+    parser.add_argument("--lora-r", type=int, help="attention LoRA rank; freezes CameraAgent and trains adapters plus pointer head")
     parser.add_argument("--seed", type=int, default=17)
     args = parser.parse_args(argv)
     if min(value for value in (args.epochs, args.batch, args.accum, args.max_length,
@@ -108,6 +110,10 @@ def parse_args(argv=None):
         parser.error("invalid optimizer settings")
     if min(args.max_steps, args.save_every_steps, args.stop_after, args.num_workers) < 0:
         parser.error("max-steps, save-every-steps, stop-after and num-workers must be nonnegative")
+    if args.lora_r is not None and args.lora_r < 0:
+        parser.error("lora-r must be nonnegative; 0 selects full-weight training")
+    if args.lora_r and args.freeze_llm:
+        parser.error("--freeze-llm would freeze the LoRA adapters; omit it with --lora-r")
     return args
 
 
@@ -144,6 +150,13 @@ def main(argv=None):
     state = read_state(resume_path) if resume_path else None
     checkpoint = resume_path or args.checkpoint
     source, metadata = checkpoint_config(checkpoint) if checkpoint else (Path(args.model), {})
+    saved_lora = metadata.get("lora_rank", 0)
+    if args.lora_r is None:
+        args.lora_r = saved_lora
+    elif checkpoint and args.lora_r != saved_lora:
+        raise ValueError("--lora-r must match the checkpoint's LoRA rank")
+    if args.lora_r and args.freeze_llm:
+        raise ValueError("--freeze-llm would freeze the LoRA adapters")
     for key, default in (("image_size", 384), ("head_dim", 256), ("max_length", 2560)):
         requested = getattr(args, key)
         if requested is None:
@@ -190,6 +203,8 @@ def main(argv=None):
         raise ValueError("this adapter expects CameraAgent internvl2_5 with ps_version v2")
     if args.image_size != getattr(config, "force_image_size", None):
         raise ValueError(f"image-size must match checkpoint force_image_size={config.force_image_size}")
+    if args.lora_r and not model.lora_rank:
+        lora.attach(model, args.lora_r)
     camera.config.use_cache = False
     camera.language_model.config.use_cache = False
     output_embeddings = camera.language_model.get_output_embeddings()
