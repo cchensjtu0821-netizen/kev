@@ -13,6 +13,7 @@ Kev 将状态文本、问题指令和候选项编码为结构化输入。当前 
 - README.md：API、How It Works
 
 文件：
+- kev-decision-query.pptx：单页横向 PowerPoint，保留本图内容、配色和版式；文字、框、连线与公式可编辑。
 - kev-decision-query.png：4400 × 3112 高清图片，白底。
 - kev-decision-query.svg：文字转为轮廓的矢量文件，插入文档无需安装中文字体。
 - kev-decision-query.pdf：A4 横向矢量 PDF。
