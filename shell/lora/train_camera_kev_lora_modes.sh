@@ -18,7 +18,7 @@ TRAIN_META="${TRAIN_META:-${META_PATH:-}}"
 VAL_META="${VAL_META:-}"
 TRAIN_DATA="${TRAIN_DATA:-}"
 VAL_DATA="${VAL_DATA:-}"
-CAMERA_ENV_BIN="${CAMERA_ENV_BIN:-/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/condaenv/MoE_CameraModel/bin}"
+CAMERA_ENV_BIN="${CAMERA_ENV_BIN:-/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/condaenv/kev_env/bin}"
 CAMERA_CODE_DIR="${CAMERA_CODE_DIR:-}"
 TORCHRUN="${TORCHRUN:-${CAMERA_ENV_BIN}/torchrun}"
 

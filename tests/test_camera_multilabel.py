@@ -189,9 +189,9 @@ def test_dataset_preflight_merges_before_training(tmp_path, layout, count):
     assert len(train[0]["record"]["questions"]) == count
 
 
-@pytest.mark.parametrize("script,layout", [("train_camera_kev_lora_modes.sh", "modes"),
-                                          ("train_camera_kev_lora_modes_seka.sh", "all")])
-def test_merged_lora_shell_launchers_forward_layout_and_resume(tmp_path, script, layout):
+@pytest.mark.parametrize("script,layout,rank", [("train_camera_kev_lora_modes.sh", "modes", 128),
+                                               ("train_camera_kev_lora_modes_seka.sh", "all", 32)])
+def test_merged_lora_shell_launchers_forward_layout_and_resume(tmp_path, script, layout, rank):
     launcher = tmp_path / "torchrun"
     body = f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n"
     launcher.write_text(body, encoding="utf-8")
@@ -202,7 +202,7 @@ def test_merged_lora_shell_launchers_forward_layout_and_resume(tmp_path, script,
                             env=env, capture_output=True, text=True, check=True)
     argv = json.loads(result.stdout)
     assert argv[argv.index("--question-layout") + 1] == layout
-    assert argv[argv.index("--lora-r") + 1] == "128"
+    assert argv[argv.index("--lora-r") + 1] == str(rank)
     assert argv[argv.index("--resume") + 1] == "latest"
 
 

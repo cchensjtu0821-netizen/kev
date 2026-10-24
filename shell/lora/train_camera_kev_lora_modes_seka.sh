@@ -6,19 +6,22 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${PROJECT_DIR}"
 
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/srv/workspace/Kirin_AI_Workspace/AIC_I/l00883213/camera_agent/hisi_dinov3_llm022/released_model/vlm_0p4_384_full_vb46k_general_domain_v3_0808}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/../../runs/camera-kev-04b-lora-modes-seka}"
+OUTPUT_DIR="${OUTPUT_DIR:-/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/CameraBaseModel/kev/outputs/MCQ/mcq_moshiseka_from_0p4dense_$(date +%Y%m%d-%H%M%S)}"
 QUESTION_LAYOUT="${QUESTION_LAYOUT:-all}"
-LORA_R="${LORA_R:-128}"
+LORA_R="${LORA_R:-32}"
 if ! [[ "${LORA_R}" =~ ^[1-9][0-9]*$ ]]; then
   echo "LORA_R must be a positive integer, got: ${LORA_R}" >&2
   exit 2
 fi
 
 TRAIN_META="${TRAIN_META:-${META_PATH:-}}"
+if [[ -z "${TRAIN_META}" && -z "${TRAIN_DATA:-}" ]]; then
+  TRAIN_META=/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/CameraBaseModel/kev/data/noul_choice/lora_seka_noul_choice.json
+fi
 VAL_META="${VAL_META:-}"
 TRAIN_DATA="${TRAIN_DATA:-}"
 VAL_DATA="${VAL_DATA:-}"
-CAMERA_ENV_BIN="${CAMERA_ENV_BIN:-/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/condaenv/MoE_CameraModel/bin}"
+CAMERA_ENV_BIN="${CAMERA_ENV_BIN:-/srv/workspace/Kirin_AI_Workspace/AIC_I/c00932551/condaenv/kev_env/bin}"
 CAMERA_CODE_DIR="${CAMERA_CODE_DIR:-}"
 TORCHRUN="${TORCHRUN:-${CAMERA_ENV_BIN}/torchrun}"
 
