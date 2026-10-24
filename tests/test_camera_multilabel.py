@@ -72,6 +72,29 @@ def test_raw_unlabelled_request_uses_the_same_merged_prompt_as_training():
         assert (a["instr"], a["options"], a["keys"]) == (b["instr"], b["options"], b["keys"])
 
 
+@pytest.mark.parametrize("label", ["阴雨", "无"])
+def test_weather_choice_merges_with_its_original_options_and_label(label):
+    source = convert_record(palette_record())
+    del source["questions"]["seka_阴雨"]
+    source["questions"]["seka_天气"] = {
+        "type": "choice", "instructions": "这幅画面的天气标签是哪一项？",
+        "criteria": {"阴雨": None, "无": "以上都不是"}, "label": label, "src": "camera"}
+    modes = prepare_record(source, "modes")
+    assert len(modes["questions"]) == 9
+    assert modes["questions"]["seka_天气"] == source["questions"]["seka_天气"]
+    merged = prepare_record(source, "all")
+    assert len(merged["questions"]) == 2
+    palette = merged["questions"]["palette"]
+    assert palette["criteria"]["天气"] == source["questions"]["seka_天气"]["criteria"]
+    assert palette["label"]["天气"] == label
+    training = materialize(source, layout="all")
+    for question in source["questions"].values():
+        del question["label"]
+    inference, _ = to_record(source, layout="all")
+    for a, b in zip(training["questions"], inference["questions"]):
+        assert (a["instr"], a["options"], a["keys"]) == (b["instr"], b["options"], b["keys"])
+
+
 def test_converter_can_merge_existing_24_or_39_question_files(tmp_path):
     source, output = tmp_path / "source.jsonl", tmp_path / "merged.jsonl"
     write_jsonl(source, [palette_record(), convert_record(palette_record())])

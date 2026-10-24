@@ -130,7 +130,10 @@ def prepare_record(row, layout="original"):
             modes["label"] = [name for name, q in zip(MODES, originals) if q["label"]]
         questions = {"modes": modes, **questions}
     if layout == "all":
-        palette_keys = ["seka_阴雨" if group == "天气" else f"seka_{group}" for group in PALETTE_GROUPS]
+        if "seka_天气" in questions and "seka_阴雨" in questions:
+            raise ValueError("record has both seka_天气 and seka_阴雨")
+        weather_key = "seka_天气" if "seka_天气" in questions else "seka_阴雨"
+        palette_keys = [weather_key if group == "天气" else f"seka_{group}" for group in PALETTE_GROUPS]
         if any(key in questions for key in palette_keys):
             if "palette" in questions:
                 raise ValueError("record has both merged and separate palette questions")
@@ -145,13 +148,14 @@ def prepare_record(row, layout="original"):
                     raise ValueError("palette dimensions must all have labels")
                 palette["label"] = {}
             for group, q in zip(PALETTE_GROUPS, originals):
-                expected = "noul" if group == "天气" else "choice"
+                binary_weather = group == "天气" and q.get("type") == "noul"
+                expected = "noul" if binary_weather else "choice"
                 if q.get("type") != expected:
                     raise ValueError(f"{group} must have type {expected}")
-                palette["criteria"][group] = {NONE: None, "阴雨": None} if group == "天气" else q["criteria"]
+                palette["criteria"][group] = {NONE: None, "阴雨": None} if binary_weather else q["criteria"]
                 if labelled:
                     label = q["label"]
-                    if group == "天气":
+                    if binary_weather:
                         if type(label) is not bool:
                             raise ValueError("weather label must be a boolean")
                         label = "阴雨" if label else NONE
