@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from kev.model import PointerHead, branch_mask_batch, user_tokens
 from kev.suite import read_json, write_json
 
+from .objectives import question_probabilities
+
 
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
@@ -122,6 +124,7 @@ class CameraDecisionModel(nn.Module):
         hidden_size = llm_config["hidden_size"] if isinstance(llm_config, dict) else llm_config.hidden_size
         self.head = PointerHead(hidden_size, head_dim)
         self.lora_rank = 0
+        self.question_layout = "original"
 
     def _features(self, pixels):
         visual = self.camera.extract_feature(pixels)
@@ -194,7 +197,7 @@ class CameraDecisionModel(nn.Module):
     @torch.no_grad()
     def probabilities(self, record, pixels):
         self.eval()
-        return [F.softmax(logits, dim=-1).cpu() for logits in self([record], pixels)[0]]
+        return [question_probabilities(q, z).cpu() for q, z in zip(record["questions"], self([record], pixels)[0])]
 
     def save(self, path, *, source, image_size):
         path = Path(path)
@@ -221,6 +224,8 @@ class CameraDecisionModel(nn.Module):
         }
         if self.lora_rank:
             config["kev"]["lora_rank"] = self.lora_rank
+        if self.question_layout != "original":
+            config["kev"]["question_layout"] = self.question_layout
         write_json(config_path, config)
 
 
@@ -254,4 +259,5 @@ def load(path, *, device="cuda", dtype=torch.bfloat16):
         lora.attach(model, metadata["lora_rank"], adapter=path / "llm_adapter")
     model.head.load_state_dict(torch.load(path / metadata.get("head_weights", "pointer.pt"),
                                          map_location="cpu", weights_only=True))
+    model.question_layout = metadata.get("question_layout", "original")
     return model.eval(), metadata

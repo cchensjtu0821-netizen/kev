@@ -83,6 +83,8 @@ def check_resume(state, args, *, world, signature, total_steps):
                if key not in ignored and getattr(args, key) != value]
     if changed:
         raise ValueError(f"resume settings changed: {', '.join(changed)}; use --checkpoint for a new training run")
+    if state["args"].get("question_layout", "original") != (args.question_layout or "original"):
+        raise ValueError("resume question-layout changed; use --checkpoint for a new training run")
     if state["data"] != signature:
         raise ValueError("resume dataset annotations, roots or repeat counts changed")
     if state["total_steps"] != total_steps:

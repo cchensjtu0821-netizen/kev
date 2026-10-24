@@ -1,6 +1,6 @@
 # CameraAgent 0.4B image decisions
 
-This path loads the dense `CameraAgentModel` checkpoint, uses its DINOv3 encoder and image projector, and trains a Kev pointer head over Qwen3 hidden states. It accepts both the 39-question `noul` records and the 24-question `noul` plus `choice` records. The two formats can be mixed in the same training JSONL or collection. The loss averages over questions within each image, then over images in an optimizer step.
+This path loads the dense `CameraAgentModel` checkpoint, uses its DINOv3 encoder and image projector, and trains a Kev pointer head over Qwen3 hidden states. It accepts the original 39-question `noul` records, 24-question `noul` plus `choice` records, and merged `multilabel` / `grouped_choice` records. Formats can be mixed in the same training JSONL or collection. The loss averages over label decisions and choice groups within each image, then over images in an optimizer step.
 
 The adapter uses one 384-pixel tile per image, ImageNet normalization, `ps_version=v2`, and the checkpoint's `extract_feature()` method. The single-tile choice follows the launcher's `dynamic_image_size=False` and `use_thumbnail=False` settings; confirm the normalization against that machine's CameraModel `build_transform` before the full run. It reads the number of projected visual tokens from the model at runtime. Training, validation and prediction place the image and state prefix once per image, followed by all its question branches in one packed forward pass. A block-causal mask lets each branch read the shared prefix and its own earlier tokens, but no other branch. Prefix activations and their keys and values are computed once while training gradients from every question flow through them. A batch whose records share the same question template and empty state has equal packed lengths, so it stacks without padding and shares one branch mask. Mixed templates or states still use padding. It does not use the older ViT bridge in `kev.vision`.
 
@@ -78,6 +78,92 @@ Python also accepts `--lora-r 64`. A positive rank freezes the entire CameraAgen
 LoRA checkpoints include the original unmerged CameraAgent weights, `llm_adapter/` and `pointer.pt`; `config.json` records `kev.lora_rank`. They load without the original base directory through the same prediction and checkpoint commands. The base and adapter remain separate so saving does not round a merged update into bf16. `--checkpoint` inherits the saved rank; `--resume` also restores the optimizer and RNG. For the LoRA shell launcher, keep `LORA_R` and all training settings the same when setting `RESUME=latest`. The full-weight checkpoint launcher can continue a LoRA checkpoint without specifying `LORA_R`. `peft` must be installed in the CameraModel Python environment.
 
 These scripts and Python modules have only been checked statically in this remote workspace. Run the one-step check on the GPU machine with the dense checkpoint and training data before starting a full run.
+
+## Merge modes and palette questions
+
+The mode launcher combines 16 Noul mode questions into one `multilabel` question. A 24-question record becomes nine questions. The modes-and-palette launcher also combines the eight palette dimensions into one `grouped_choice` question, leaving two questions per image. Both inherit the Seka launcher's rank 128, GPUs 4-7, batch 8 per GPU and accumulation 1. Override those settings as needed.
+
+```bash
+# Mode merging only; 39- and 24-question annotations are merged during loading.
+MODEL_NAME_OR_PATH=/data/models/camera-agent-04b \
+  TRAIN_DATA=/data/train.jsonl VAL_DATA=/data/val.jsonl \
+  OUTPUT_DIR=/data/runs/kev-lora-modes \
+  bash shell/lora/train_camera_kev_lora_modes.sh
+
+# One mode question and one palette question.
+MODEL_NAME_OR_PATH=/data/models/camera-agent-04b \
+  TRAIN_META=/data/kev/train.json VAL_META=/data/kev/val.json \
+  OUTPUT_DIR=/data/runs/kev-lora-modes-seka \
+  bash shell/lora/train_camera_kev_lora_modes_seka.sh
+
+# One-step check before a full run. Use a separate output directory.
+CUDA_VISIBLE_DEVICES=0 GPUS=1 PER_DEVICE_BATCH_SIZE=1 MAX_STEPS=1 \
+  MODEL_NAME_OR_PATH=/data/models/camera-agent-04b TRAIN_DATA=/data/train.jsonl \
+  OUTPUT_DIR=/data/runs/kev-lora-merged-check \
+  bash shell/lora/train_camera_kev_lora_modes_seka.sh
+```
+
+Any existing launcher accepts `QUESTION_LAYOUT=modes` or `QUESTION_LAYOUT=all`; Python accepts `--question-layout`. The default `original` keeps the sample's supplied layout, including already merged samples. Checkpoints save the load-time layout so prediction and calibration apply the same transformation. Python inherits it when continuing from a checkpoint; keep it unchanged when using `RESUME=latest` with a shell launcher.
+
+To write merged annotations instead of merging during loading, keep the output beside its input so relative image paths stay valid:
+
+```bash
+python -m scripts.convert_vision_labels /data/train.jsonl /data/train-modes.jsonl --merge modes
+python -m scripts.convert_vision_labels /data/train.jsonl /data/train-merged.jsonl --merge all
+python -m kev.camera.train --train-data /data/train.jsonl --question-layout all --validate-data
+```
+
+The converter accepts 39- or 24-question input when `--merge` is supplied. It retains the existing conflicting-label checks on the 39-question source. Without `--merge`, it retains the original 39-to-24 conversion. Neither operation changes image splits. Mode names and palette labels come from the same conversion rules as before.
+
+A small example of the new formats follows. Production samples can list all 16 modes and eight palette dimensions.
+
+```json
+{
+  "image": "images/001.jpg",
+  "state": "",
+  "questions": {
+    "modes": {
+      "type": "multilabel",
+      "instructions": "选择这张图适用的全部模式。",
+      "criteria": {"夜景": null, "大烟花": null, "雨景": null},
+      "label": ["夜景", "大烟花"]
+    },
+    "palette": {
+      "type": "grouped_choice",
+      "instructions": "选择各维度的色卡标签，每个维度选一项。",
+      "criteria": {
+        "色调": {"暖调": null, "冷调": null, "中性色调": null, "混合色调": null},
+        "时间": {"白天": null, "夜晚": null, "无": null}
+      },
+      "label": {"色调": "冷调", "时间": "夜晚"}
+    }
+  }
+}
+```
+
+`multilabel` uses one independent logit per option and binary cross-entropy with logits. Its label is a list of selected names; an empty list is valid. Every unselected option is a negative. The loss averages over all option labels, rather than dividing by the number of positive labels. `grouped_choice` uses one packed branch with a separate softmax and cross-entropy for each dimension. Weather has the two options `无` and `阴雨`. Other groups retain their explicit `无` option where the original converter provided it. A custom palette with genuinely independent labels can also use `multilabel`; that changes its label constraints.
+
+Merging preserves the original 24-task weights: each mode contributes one BCE term, and each palette dimension contributes one CE term. The image loss is their sum divided by 24, including when the input has only two questions. Validation reports the same task-level accuracy and Brier, plus multi-label micro-F1 and exact match at threshold 0.5. These Camera formats do not extend the text-only System One API or the older vision bridge.
+
+## Calibrate multi-label thresholds
+
+After training, fit thresholds on held-out images. The command selects one threshold per multi-label question to maximize micro-F1 on those images, keeping tied scores together. Selection uses `probability > threshold`. This fits a decision threshold; it does not calibrate probabilities or estimate performance on a fresh test set.
+
+```bash
+python -m kev.camera.calibrate \
+  --checkpoint /data/runs/kev-lora-modes-seka/final \
+  --val-data /data/val.jsonl \
+  --out /data/runs/kev-lora-modes-seka/thresholds.json
+
+python -m kev.camera.predict \
+  --checkpoint /data/runs/kev-lora-modes-seka/final \
+  --request /data/request.json \
+  --calibration /data/runs/kev-lora-modes-seka/thresholds.json
+```
+
+Calibration also accepts `--val-meta`; repeat counts must be one. Use images disjoint from training, split by original image or scene. When the checkpoint's training annotation paths are still available, calibration checks image-path overlap. If data was moved, keep that split yourself. The artifact records annotation hashes, the checkpoint config/head/adapter hashes, option order and instruction text. Prediction rejects an artifact from a different checkpoint or a changed question schema. Refit it after further training. `--out` must name a new file.
+
+For prediction, omit `label` fields. Raw known Camera questions are merged according to the checkpoint's layout; already merged questions can be supplied directly. Multi-label results contain `probabilities`, `threshold` and `selected`. Grouped palette results contain one `choice` and probability distribution per dimension. Without a calibration file, multi-label selection uses 0.5; `--threshold` changes the fallback. Both commands accept `--device cpu` for environments where the checkpoint's custom code supports CPU.
 
 ## Checkpoint format
 

@@ -8,12 +8,12 @@ import random
 import time
 from contextlib import nullcontext
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -23,16 +23,19 @@ from kev.suite import read_json, read_jsonl, write_jsonl
 from .data import CameraImageDataset
 from . import lora
 from .model import CameraDecisionModel, checkpoint_config, load, load_camera
+from .objectives import image_loss, question_probabilities, task_scores
+from .questions import materialize
 from .resume import (ResumableBatchSampler, check_resume, data_signature, find_resume,
                      read_state, restore_rng, save_checkpoint)
 
 
 def datasets(args):
-    train = ImageDecisionDataset(data=args.train_data, meta=args.train_meta)
+    materializer = partial(materialize, layout=args.question_layout or "original")
+    train = ImageDecisionDataset(data=args.train_data, meta=args.train_meta, materializer=materializer)
     train_images = {train[i]["image"] for i in range(len(train))}
     if not (args.val_data or args.val_meta):
         return train, None
-    valid = ImageDecisionDataset(data=args.val_data, meta=args.val_meta)
+    valid = ImageDecisionDataset(data=args.val_data, meta=args.val_meta, materializer=materializer)
     train_files = {source[1].resolve() for source, _, _ in train.sources}
     valid_files = {source[1].resolve() for source, _, _ in valid.sources}
     if train_files & valid_files:
@@ -50,10 +53,8 @@ def first_item(items):
     return items[0]
 
 
-def evaluate(model, loader, *, device):
+def predictions(model, loader, *, device):
     model.eval()
-    correct = count = 0
-    brier = 0.0
     with torch.inference_mode():
         for item in loader:
             pixels = item["pixels"].to(device=device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
@@ -61,12 +62,32 @@ def evaluate(model, loader, *, device):
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 logits = model([item["record"]], pixels)[0]
             for question, z in zip(item["record"]["questions"], logits):
-                p = z.float().softmax(-1)
-                label = question["label"]
-                correct += int(p.argmax().item() == label)
-                brier += float(((p - F.one_hot(torch.tensor(label, device=device), p.numel())) ** 2).sum())
-                count += 1
-    return {"questions": count, "accuracy": correct / count, "brier": brier / count}
+                yield question, question_probabilities(question, z.float())
+
+
+def evaluate(model, loader, *, device):
+    correct = count = 0
+    brier = 0.0
+    tp = fp = fn = exact = multi_count = 0
+    for question, p in predictions(model, loader, device=device):
+        hits, errors = task_scores(question, p)
+        correct += sum(hits)
+        brier += sum(errors)
+        count += len(hits)
+        if question.get("qtype") == "multilabel":
+            target = p.new_tensor(question["label"]).bool()
+            selected = p > 0.5
+            tp += int((selected & target).sum())
+            fp += int((selected & ~target).sum())
+            fn += int((~selected & target).sum())
+            exact += int(torch.equal(selected, target))
+            multi_count += 1
+    result = {"questions": count, "accuracy": correct / count, "brier": brier / count}
+    if multi_count:
+        result["multilabel"] = {"questions": multi_count, "threshold": 0.5,
+                                "exact_match": exact / multi_count,
+                                "micro_f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0}
+    return result
 
 
 def parse_args(argv=None):
@@ -102,6 +123,8 @@ def parse_args(argv=None):
     parser.add_argument("--freeze-mlp", action="store_true")
     parser.add_argument("--lora-r", type=int, help="attention LoRA rank; freezes CameraAgent and trains adapters plus pointer head")
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--question-layout", choices=("original", "modes", "all"),
+                        help="merge at load time; premerged samples also work with original; inherits checkpoint")
     args = parser.parse_args(argv)
     if min(value for value in (args.epochs, args.batch, args.accum, args.max_length,
                               args.image_size, args.head_dim) if value is not None) < 1:
@@ -118,7 +141,7 @@ def parse_args(argv=None):
 
 
 def train_batch(wrapped, items, *, device, group_images, sync_at_end):
-    """Forward the image batch together and average each image's questions."""
+    """Forward images together and average their original label/group tasks."""
     pixels = torch.cat([item["pixels"] for item in items]).to(
         device=device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         non_blocking=True)
@@ -129,10 +152,7 @@ def train_batch(wrapped, items, *, device, group_images, sync_at_end):
         logits = wrapped(records, pixels)
         losses = []
         for record, image_logits in zip(records, logits):
-            question_losses = [F.cross_entropy(z.float().unsqueeze(0),
-                                               torch.tensor([question["label"]], device=device))
-                               for question, z in zip(record["questions"], image_logits)]
-            losses.append(torch.stack(question_losses).mean())
+            losses.append(image_loss(record, image_logits))
         loss = torch.stack(losses).sum() / group_images
     loss.backward()
     return float(loss.detach()) * group_images
@@ -140,15 +160,17 @@ def train_batch(wrapped, items, *, device, group_images, sync_at_end):
 
 def main(argv=None):
     args = parse_args(argv)
+    resume_path = find_resume(args.resume, args.out) if args.resume else None
+    checkpoint = resume_path or args.checkpoint
+    if args.question_layout is None:
+        args.question_layout = checkpoint_config(checkpoint)[1].get("question_layout", "original") if checkpoint else "original"
     train, valid = datasets(args)
     if args.validate_data:
         print(json.dumps({"train_images": len(train), "validation_images": len(valid) if valid is not None else 0}))
         return
     if not (args.model or args.checkpoint or args.resume) or not args.out:
         raise ValueError("training needs --model, --checkpoint or --resume, and --out")
-    resume_path = find_resume(args.resume, args.out) if args.resume else None
     state = read_state(resume_path) if resume_path else None
-    checkpoint = resume_path or args.checkpoint
     source, metadata = checkpoint_config(checkpoint) if checkpoint else (Path(args.model), {})
     saved_lora = metadata.get("lora_rank", 0)
     if args.lora_r is None:
@@ -197,6 +219,7 @@ def main(argv=None):
         model = CameraDecisionModel(camera, tokenizer, head_dim=args.head_dim,
                                     max_length=args.max_length).to(device)
     config = camera.config
+    model.question_layout = args.question_layout
     if getattr(config, "model_type", None) != "camera_agent":
         raise ValueError("--model must point to a camera_agent checkpoint")
     if getattr(config, "template", None) != "internvl2_5" or getattr(config, "ps_version", None) != "v2":
@@ -273,7 +296,7 @@ def main(argv=None):
         print(json.dumps({"event": "train_start", "images": len(train_images), "epochs": args.epochs,
                           "progress": f"{step}/{total_steps}", "resume": str(resume_path) if resume_path else None,
                           "gpus": world, "batch_per_gpu": args.batch,
-                          "accum": args.accum,
+                          "accum": args.accum, "question_layout": args.question_layout,
                           "attention_backend": camera.language_model.config._attn_implementation}), flush=True)
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, args.epochs):
