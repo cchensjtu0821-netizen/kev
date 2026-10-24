@@ -1,0 +1,23 @@
+图：Kev 决策查询流程与原理。
+
+Kev 将状态文本、问题指令和候选项编码为结构化输入。当前 Qwen3.5/Qwen3.8 文本版在线推理先处理状态前缀，再让各问题分支复用前缀缓存独立执行因果前向计算。每个问题分支只能读取共享状态及自身的先前 token。模型读取问题末尾 <decide> 与各候选项末尾 </opt> 的隐状态，经可学习投影和缩放点积得到候选分数，再以温度 T 校准并通过 Softmax 转换为候选概率。判断任务返回 p(true)，选择任务返回最大概率选项，评分任务返回等级索引的概率加权均值。整个过程只执行预填充计算，不进行逐 token 文本生成。
+
+符号：i 为问题索引，j 为候选项索引；hᴰ 为问题读出隐状态；hᴼ 为候选项读出隐状态；Q、K 为含偏置的可学习线性投影；d_p 为指针投影维度，默认 256；T 为正的校准温度。温度缩放不改变单个问题内的最大分数候选项。
+
+适用范围：当前 Kev 文本模型的在线推理。本图不表示 CameraAgent 图像版。当前混合骨干采用独立问题行，注意力层缓存 KV，DeltaNet 层缓存循环状态和卷积状态。纯注意力骨干也可用分块因果掩码实现相同的问题隔离关系。问题隔离不保证题内选项置换不变。前向计算可按 token 预算拆成多批，“仅预填充”不表示整次请求只能调用一次模型。
+
+代码依据：
+- kev/api.py：to_record、to_answers
+- kev/model.py：encode、rows_of、PointerHead、prefix、probs_and_prefix、probs_with_prefix
+- kev/serve.py：PrefixCache、Server.answer、Server._body
+- README.md：API、How It Works
+
+文件：
+- kev-decision-query.pptx：单页横向 PowerPoint，保留本图内容、配色和版式；文字、框、连线与公式可编辑。
+- kev-decision-query.png：4400 × 3112 高清图片，白底。
+- kev-decision-query.svg：文字转为轮廓的矢量文件，插入文档无需安装中文字体。
+- kev-decision-query.pdf：A4 横向矢量 PDF。
+- kev-decision-query-editable.svg：保留文本的 SVG，编辑时建议安装 Noto Sans CJK SC。
+- kev-decision-query.drawio：可在 diagrams.net 中编辑框、文字与连线。
+
+本图依据当前工作区代码绘制，不含训练或模型精度验证结果。

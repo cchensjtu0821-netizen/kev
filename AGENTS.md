@@ -10,6 +10,14 @@ docs/autoresearch.md (the operating program for an unattended research session) 
 checkpoint: recipe + metrics). README follows the Vercel Labs house style (tagline, for-the-badge badges, Highlights,
 Title Case sections, API tables, Authors + License); model cards are formal.
 
+## Git workflow
+
+- Work directly on `main` and push completed, authorized changes to `origin/main` by default. Create another branch or a
+  pull request only when the user explicitly asks for one.
+- When the user says to commit, push, or "上库", publish to `main`; pushing only to a feature branch does not complete
+  that request. Integrate the latest remote changes without force-pushing or dropping existing commits.
+- This repository-specific workflow takes precedence over branch and PR workflows described in the repo skills.
+
 ## Current CameraAgent workspace
 
 This server is a remote, code-only workspace. It has no VLM training data, CameraAgent 0.4B checkpoint, GPU, or prepared

@@ -14,10 +14,11 @@ class ImageDecisionDataset:
     not a decision label and cannot be converted without annotation.
     """
 
-    def __init__(self, *, data=None, meta=None):
+    def __init__(self, *, data=None, meta=None, materializer=materialize):
         if bool(data) == bool(meta):
             raise ValueError("pass exactly one of data or meta")
         self.sources = []
+        self.materializer = materializer
         if data:
             self._add("data", Path(data), Path(data).resolve().parent, 1.0)
         else:
@@ -83,5 +84,5 @@ class ImageDecisionDataset:
         request = {"state": row.get("state", ""), "questions": {
             key: {**question, "src": question.get("src", name)}
             for key, question in row["questions"].items()}}
-        record = materialize(request)
+        record = self.materializer(request)
         return {"image": image, "record": record, "source": name}

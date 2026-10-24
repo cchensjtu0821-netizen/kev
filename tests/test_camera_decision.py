@@ -604,7 +604,8 @@ def test_camera_shell_entrypoints_select_one_source(tmp_path, script, mode):
 ])
 def test_camera_lora_shell_defaults_and_resume(tmp_path, script, rank, gpus, batch):
     launcher = tmp_path / "torchrun"
-    launcher.write_text(f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+    body = f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n"
+    launcher.write_text(body, encoding="utf-8")
     launcher.chmod(0o755)
     model = tmp_path / "model"
     model.mkdir()
@@ -629,10 +630,13 @@ def test_camera_lora_shell_defaults_and_resume(tmp_path, script, rank, gpus, bat
         assert sum(arg in ("--model", "--checkpoint", "--resume") for arg in argv) == 1
 
 
-def test_camera_lora_roundtrip_preserves_frozen_base_and_updated_adapter(tmp_path, tiny_checkpoints, monkeypatch):
+@pytest.mark.parametrize("merged", [False, True])
+def test_camera_lora_roundtrip_preserves_frozen_base_and_updated_adapter(tmp_path, tiny_checkpoints, monkeypatch, merged):
     """Synthetic Qwen tensors exercise PEFT gradients and the standalone save format."""
     from transformers import Qwen3Config, Qwen3ForCausalLM
     from kev.camera import lora
+    from kev.camera.objectives import image_loss
+    from kev.camera.questions import materialize
 
     def make_camera():
         camera = tiny_checkpoints()
@@ -666,16 +670,22 @@ def test_camera_lora_roundtrip_preserves_frozen_base_and_updated_adapter(tmp_pat
     assert any("lora_" in name for name in trainable)
     assert all("lora_" in name or name.startswith("head.") for name in trainable)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.01)
+    sample = materialize({"state": "photo", "questions": {
+        "modes": {"type": "multilabel", "criteria": {"night": None, "fireworks": None, "rain": None},
+                  "label": ["night", "fireworks"]},
+        "palette": {"type": "grouped_choice", "criteria": {
+            "tone": {"warm": None, "cold": None}, "time": {"day": None, "night": None}},
+            "label": {"tone": "cold", "time": "night"}}}}) if merged else record()
+    model.question_layout = "all" if merged else "original"
     model.train()
-    logits = model([record()], torch.tensor([1.0]))[0]
-    sum(F.cross_entropy(z.unsqueeze(0), torch.tensor([q["label"]]))
-        for q, z in zip(record()["questions"], logits)).backward()
+    logits = model([sample], torch.tensor([1.0]))[0]
+    image_loss(sample, logits).backward()
     assert any(value.grad is not None and value.grad.abs().sum() > 0
                for name, value in model.named_parameters() if "lora_B" in name)
     assert all(value.grad is None for name, value in model.camera.named_parameters() if "lora_" not in name)
     optimizer.step()
     model.eval()
-    expected = model.probabilities(record(), torch.tensor([1.0]))
+    expected = model.probabilities(sample, torch.tensor([1.0]))
     path = tmp_path / "checkpoint"
     model.save(path, source=tmp_path / "absent-original-base", image_size=8)
     saved_base = torch.load(path / "tiny.pt", weights_only=True)
@@ -683,7 +693,8 @@ def test_camera_lora_roundtrip_preserves_frozen_base_and_updated_adapter(tmp_pat
     loaded, metadata = camera_model.load(path, device="cpu", dtype=torch.float32)
     assert metadata["lora_rank"] == 2
     assert loaded.lora_rank == 2
-    actual = loaded.probabilities(record(), torch.tensor([1.0]))
+    assert loaded.question_layout == model.question_layout
+    actual = loaded.probabilities(sample, torch.tensor([1.0]))
     for left, right in zip(actual, expected):
         torch.testing.assert_close(left, right, atol=0, rtol=0)
 
